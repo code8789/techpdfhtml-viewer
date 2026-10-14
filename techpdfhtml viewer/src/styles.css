@@ -103,7 +103,8 @@
 }
 
 .teach-actions::-webkit-scrollbar,
-.teach-dock::-webkit-scrollbar {
+.teach-dock::-webkit-scrollbar,
+.teach-dock-scroll::-webkit-scrollbar {
   display: none;
 }
 
@@ -378,13 +379,24 @@
   bottom: max(0.5rem, env(safe-area-inset-bottom));
   display: flex;
   gap: 0.25rem;
-  overflow-x: auto;
-  scrollbar-width: none;
   padding: 0.35rem;
   border-radius: 1rem;
   background: color-mix(in srgb, var(--color-surface) 94%, transparent);
   border: 1px solid var(--color-border);
   box-shadow: 0 12px 32px rgb(0 0 0 / 0.28);
+  overflow: hidden;
+}
+
+.teach-dock-scroll {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+  -webkit-overflow-scrolling: touch;
 }
 
 .teach-tool {
@@ -614,9 +626,121 @@
   width: 0%;
 }
 
+/* ---------- Pen colors: single horizontal row ---------- */
+.ink-colors {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 0.25rem;
+  flex: 0 0 auto;
+  padding: 0 0.15rem;
+}
+
+.ink-colors .swatch {
+  width: 1.6rem;
+  height: 1.6rem;
+  border-width: 2px;
+}
+
+.eraser-size {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+  padding: 0 0.25rem;
+}
+
+.eraser-size input[type="range"] {
+  width: 5rem;
+  accent-color: var(--color-primary);
+}
+
+/* ---------- Focus mode: hide top bar + dock ---------- */
+.teach-app.is-focus .teach-top,
+.teach-app.is-focus .teach-dock,
+.teach-app.is-focus .teach-sheet,
+.teach-app.is-focus .teach-drawer,
+.teach-app.is-focus .teach-pop,
+.teach-app.is-focus .teach-chip {
+  display: none;
+}
+
+.teach-app.is-focus .teach-scroll {
+  scrollbar-gutter: auto;
+}
+
+.teach-app.is-focus .dock-spacer {
+  height: 1rem;
+}
+
+/* ---------- Mobile sizing ---------- */
 @media (max-width: 720px) {
   .teach-brand strong,
   .teach-actions .label {
+    display: none;
+  }
+}
+
+@media (max-width: 640px) {
+  .teach-top {
+    min-height: 3rem;
+    padding: 0.3rem 0.4rem;
+    padding-top: max(0.3rem, env(safe-area-inset-top));
+    gap: 0.25rem;
+  }
+
+  .teach-brand img {
+    width: 1.6rem;
+    height: 1.6rem;
+  }
+
+  .teach-actions {
+    gap: 0.2rem;
+  }
+
+  .teach-btn {
+    height: 2.4rem;
+    min-width: 2.4rem;
+    padding: 0 0.45rem;
+    border-radius: 0.6rem;
+  }
+
+  .teach-dock {
+    left: 0.35rem;
+    right: 0.35rem;
+    bottom: max(0.35rem, env(safe-area-inset-bottom));
+    padding: 0.3rem;
+    border-radius: 0.85rem;
+  }
+
+  .teach-dock-scroll {
+    gap: 0.15rem;
+  }
+
+  .teach-tool {
+    width: 2.35rem;
+    height: 2.35rem;
+    border-radius: 0.6rem;
+  }
+
+  .ink-colors {
+    gap: 0.15rem;
+    padding: 0 0.1rem;
+  }
+
+  .ink-colors .swatch {
+    width: 1.35rem;
+    height: 1.35rem;
+  }
+
+  .dock-spacer {
+    height: 4.75rem;
+  }
+
+  .teach-empty {
+    padding: 1rem 0.75rem 5.5rem;
+  }
+
+  .teach-empty .gesture-list {
     display: none;
   }
 }
