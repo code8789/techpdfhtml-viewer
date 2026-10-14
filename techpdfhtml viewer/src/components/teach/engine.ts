@@ -11,10 +11,11 @@ import {
 
 const TILE = 1800;
 const MIN_Z = 0.5;
-const MAX_Z = 5;
+const MAX_Z = 20;                // was 5
 const HISTORY = 40;
 const DOCK_GAP = 92;
 const MAX_EDGE = 2048;
+const MAX_CANVAS_EDGE = 8192;    // Safari canvas safety
 
 export type Tool =
   | "hand"
@@ -267,7 +268,6 @@ async function readText(file: Blob, onRatio: (n: number) => void) {
   return chunks.join("");
 }
 
-
 function splitHtmlDocuments(html: string): string[] {
   const doc = new DOMParser().parseFromString(html, "text/html");
   const all = [
@@ -441,6 +441,7 @@ export class Engine {
   private wheelT = 0;
   private progLast = 0;
   private lastInvert = false;
+  private pinchRerenderTimer = 0;   // NEW: deferred reraster during pinch
 
   constructor(
     private els: StageEls,
@@ -474,6 +475,7 @@ export class Engine {
     this.alive = false;
     this.docGen++;
     this.stopMomentum();
+    window.clearTimeout(this.pinchRerenderTimer);
     this.clearDoc();
     const scroll = this.els.scroll;
     scroll.removeEventListener("pointerdown", this.onPointerDown, { capture: true });
@@ -1305,6 +1307,11 @@ export class Engine {
       bw *= k;
       bh *= k;
     }
+    if (bw > MAX_CANVAS_EDGE || bh > MAX_CANVAS_EDGE) {
+      const k = MAX_CANVAS_EDGE / Math.max(bw, bh);
+      bw *= k;
+      bh *= k;
+    }
     const w = Math.max(1, Math.round(bw));
     const h = Math.max(1, Math.round(bh));
     if (canvas.width === w && canvas.height === h) return false;
@@ -1338,6 +1345,11 @@ export class Engine {
       const edge = Math.max(targetW, targetH);
       if (edge > MAX_EDGE) {
         const k = MAX_EDGE / edge;
+        targetW *= k;
+        targetH *= k;
+      }
+      if (targetW > MAX_CANVAS_EDGE || targetH > MAX_CANVAS_EDGE) {
+        const k = MAX_CANVAS_EDGE / Math.max(targetW, targetH);
         targetW *= k;
         targetH *= k;
       }
@@ -1723,6 +1735,7 @@ export class Engine {
         this.mode = "none";
         this.blockUntilUp = this.pointers.size > 0;
         this.commitZoom();
+        this.schedulePdfRerender();
       }
       return;
     }
@@ -1767,7 +1780,10 @@ export class Engine {
     scroll.scrollTop = layoutY * this.visualRatio - oy;
     this.hooks.onZoom(next);
     window.clearTimeout(this.wheelT);
-    this.wheelT = window.setTimeout(() => this.commitZoom(), 160);
+    this.wheelT = window.setTimeout(() => {
+      this.commitZoom();
+      this.schedulePdfRerender();
+    }, 160);
   };
 
   private onScroll = () => {
@@ -1889,6 +1905,20 @@ export class Engine {
     scroll.scrollTop = layoutY * this.visualRatio - noy;
     this.lastMid = mid;
     this.hooks.onZoom(next);
+    this.schedulePdfRerender();
+  }
+
+  /** NEW: debounce heavy PDF reraster while user is still pinching */
+  private schedulePdfRerender() {
+    if (!this.doc || this.doc.kind !== "pdf") return;
+    window.clearTimeout(this.pinchRerenderTimer);
+    this.pinchRerenderTimer = window.setTimeout(() => {
+      if (!this.doc || this.doc.kind !== "pdf") return;
+      if (this.mode === "pinch") return;
+      for (const page of this.doc.pages) {
+        if (page.mounted && page.pdfCanvas) void this.renderPdf(page);
+      }
+    }, 220);
   }
 
   private beginShape(page: Page, tool: Tool, event: PointerEvent) {
