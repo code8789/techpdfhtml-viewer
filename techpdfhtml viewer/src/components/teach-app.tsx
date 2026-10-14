@@ -422,14 +422,7 @@ export function TeachApp() {
             aria-pressed={tool === "scrub"}
             onClick={() => setTool("scrub")}
           >
-            <button
-            type="button"
-            onClick={() => {
-              // Your button action here
-            }}
-            className="..."
-          >
-            <Grid size={20} />
+            <PixelIcon />
           </button>
           {(tool === "eraser" || tool === "scrub") && (
             <label className="eraser-size">
@@ -737,6 +730,26 @@ function PagesIcon() {
     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
       <rect x="4" y="3" width="12" height="16" rx="1.5" />
       <path d="M8 7h6M8 11h6M10 19h10v2" />
+    </svg>
+  );
+}
+
+function PixelIcon() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+      <rect x="3" y="3" width="7" height="7" rx="1" />
+      <rect x="14" y="3" width="7" height="7" rx="1" />
+      <rect x="3" y="14" width="7" height="7" rx="1" />
+      <rect x="14" y="14" width="7" height="7" rx="1" />
+    </svg>
+  );
+}
+
+function DetectIcon() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+      <path d="M3 7V5a2 2 0 0 1 2-2h2M17 3h2a2 2 0 0 1 2 2v2M21 17v2a2 2 0 0 1-2 2h-2M7 21H5a2 2 0 0 1-2-2v-2" />
+      <circle cx="12" cy="12" r="3" />
     </svg>
   );
 }
