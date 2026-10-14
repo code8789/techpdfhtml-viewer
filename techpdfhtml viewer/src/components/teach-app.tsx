@@ -212,6 +212,25 @@ export function TeachApp() {
     if (files.length) void engineRef.current?.openFiles(files);
   }
 
+  function toggleFocus() {
+    setPadsHidden((hidden) => !hidden);
+    if (typeof document === "undefined") return;
+    const doc = document as Document & {
+      webkitFullscreenElement?: Element | null;
+      webkitExitFullscreen?: () => Promise<void>;
+    };
+    const el = document.documentElement as HTMLElement & {
+      webkitRequestFullscreen?: () => Promise<void>;
+    };
+    if (!document.fullscreenElement && !doc.webkitFullscreenElement) {
+      if (el.requestFullscreen) void el.requestFullscreen().catch(() => {});
+      else if (el.webkitRequestFullscreen) void el.webkitRequestFullscreen().catch(() => {});
+    } else {
+      if (document.exitFullscreen) void document.exitFullscreen().catch(() => {});
+      else if (doc.webkitExitFullscreen) void doc.webkitExitFullscreen().catch(() => {});
+    }
+  }
+
   return (
     <div className={`teach-app${padsHidden ? " is-focus" : ""}`}>
       <header className="teach-top">
@@ -268,6 +287,11 @@ export function TeachApp() {
         onDrop={(event) => {
           event.preventDefault();
           chooseFiles(event.dataTransfer.files);
+        }}
+        onDoubleClick={(event) => {
+          const target = event.target as HTMLElement;
+          if (target.closest(".teach-dock, .teach-top, .teach-sheet, .teach-drawer, button, input, a")) return;
+          setPadsHidden((hidden) => !hidden);
         }}
       >
         <Stage hooksRef={hooksRef} onReady={onReady} />
@@ -371,194 +395,196 @@ export function TeachApp() {
         )}
 
         <div className="teach-dock" role="toolbar" aria-label="Teaching tools">
-          <button
-            type="button"
-            className={`teach-tool${tool === "hand" ? " is-on" : ""}`}
-            aria-label="Pan"
-            aria-pressed={tool === "hand"}
-            onClick={() => setTool("hand")}
-          >
-            <Hand size={18} />
-          </button>
-          <button
-            type="button"
-            className={`teach-tool${tool === "pen" ? " is-on" : ""}`}
-            aria-label="Pen"
-            aria-pressed={tool === "pen"}
-            onClick={() => setTool("pen")}
-          >
-            <Pencil size={18} />
-          </button>
-          <div className="ink-colors" role="listbox" aria-label="Pen colors">
-            {COLORS.map((swatch) => (
-              <button
-                key={swatch}
-                type="button"
-                role="option"
-                aria-selected={color === swatch}
-                aria-label={colorName(swatch)}
-                className={`swatch${color === swatch ? " is-on" : ""}${swatch === "#ffffff" ? " swatch-light" : ""}`}
-                style={{ background: swatch }}
-                onClick={() => {
-                  setColor(swatch);
-                  if (tool !== "highlighter" && tool !== "text") setTool("pen");
-                }}
-              />
-            ))}
+          <div className="teach-dock-scroll">
+            <button
+              type="button"
+              className={`teach-tool${tool === "hand" ? " is-on" : ""}`}
+              aria-label="Pan"
+              aria-pressed={tool === "hand"}
+              onClick={() => setTool("hand")}
+            >
+              <Hand size={18} />
+            </button>
+            <button
+              type="button"
+              className={`teach-tool${tool === "pen" ? " is-on" : ""}`}
+              aria-label="Pen"
+              aria-pressed={tool === "pen"}
+              onClick={() => setTool("pen")}
+            >
+              <Pencil size={18} />
+            </button>
+            <div className="ink-colors" role="listbox" aria-label="Pen colors">
+              {COLORS.map((swatch) => (
+                <button
+                  key={swatch}
+                  type="button"
+                  role="option"
+                  aria-selected={color === swatch}
+                  aria-label={colorName(swatch)}
+                  className={`swatch${color === swatch ? " is-on" : ""}${swatch === "#ffffff" ? " swatch-light" : ""}`}
+                  style={{ background: swatch }}
+                  onClick={() => {
+                    setColor(swatch);
+                    if (tool !== "highlighter" && tool !== "text") setTool("pen");
+                  }}
+                />
+              ))}
+            </div>
+            <button
+              type="button"
+              className={`teach-tool${tool === "eraser" ? " is-on" : ""}`}
+              aria-label="Object eraser"
+              aria-pressed={tool === "eraser"}
+              onClick={() => setTool("eraser")}
+            >
+              <Eraser size={18} />
+            </button>
+            <button
+              type="button"
+              className={`teach-tool${tool === "scrub" ? " is-on" : ""}`}
+              aria-label="Pixel eraser"
+              aria-pressed={tool === "scrub"}
+              onClick={() => setTool("scrub")}
+            >
+              <PixelIcon />
+            </button>
+            {(tool === "eraser" || tool === "scrub") && (
+              <label className="eraser-size">
+                <span className="sr-only">{tool === "scrub" ? "Pixel eraser size" : "Object eraser size"}</span>
+                <input
+                  type="range"
+                  min={4}
+                  max={48}
+                  value={eraserSize}
+                  onChange={(event) => setEraserSize(Number(event.target.value))}
+                />
+              </label>
+            )}
+            <button
+              type="button"
+              className={`teach-tool${tool === "laser" ? " is-on" : ""}`}
+              aria-label="Laser"
+              aria-pressed={tool === "laser"}
+              onClick={() => setTool("laser")}
+            >
+              <Crosshair size={18} />
+            </button>
+            <button
+              type="button"
+              className={`teach-tool${shapeDetect ? " is-on" : ""}`}
+              aria-label={shapeDetect ? "Shape detection on" : "Shape detection off"}
+              aria-pressed={shapeDetect}
+              onClick={() => {
+                setShapeDetect((on) => !on);
+                setTool("pen");
+              }}
+            >
+              <DetectIcon />
+            </button>
+            <button
+              type="button"
+              className={`teach-tool${tool === "line" ? " is-on" : ""}`}
+              aria-label="Line"
+              aria-pressed={tool === "line"}
+              onClick={() => setTool("line")}
+            >
+              <Slash size={18} />
+            </button>
+            <button
+              type="button"
+              className={`teach-tool${tool === "rect" ? " is-on" : ""}`}
+              aria-label="Rectangle"
+              aria-pressed={tool === "rect"}
+              onClick={() => setTool("rect")}
+            >
+              <Square size={18} />
+            </button>
+            <button
+              type="button"
+              className={`teach-tool${tool === "circle" ? " is-on" : ""}`}
+              aria-label="Circle"
+              aria-pressed={tool === "circle"}
+              onClick={() => setTool("circle")}
+            >
+              <Circle size={18} />
+            </button>
+            <button
+              type="button"
+              className={`teach-tool${tool === "arrow" ? " is-on" : ""}`}
+              aria-label="Arrow"
+              aria-pressed={tool === "arrow"}
+              onClick={() => setTool("arrow")}
+            >
+              <ArrowUpRight size={18} />
+            </button>
+            <button
+              type="button"
+              className={`teach-tool${tool === "text" ? " is-on" : ""}`}
+              aria-label="Text"
+              aria-pressed={tool === "text"}
+              onClick={() => setTool("text")}
+            >
+              <Type size={18} />
+            </button>
+            <button
+              type="button"
+              className={`teach-tool${tool === "highlighter" ? " is-on" : ""}`}
+              aria-label="Highlighter"
+              aria-pressed={tool === "highlighter"}
+              onClick={() => setTool("highlighter")}
+            >
+              <Highlighter size={18} />
+            </button>
+            <button
+              type="button"
+              className={`teach-tool${blankOpen ? " is-on" : ""}`}
+              aria-label="Add a blank page"
+              aria-pressed={blankOpen}
+              onClick={() => {
+                setBlankOpen((open) => !open);
+                setSettingsOpen(false);
+              }}
+            >
+              <FilePlus size={18} />
+            </button>
+            <button
+              type="button"
+              className="teach-tool"
+              aria-label="Add image, GIF, or video"
+              onClick={() => mediaRef.current?.click()}
+            >
+              <ImagePlus size={18} />
+            </button>
+            <button
+              type="button"
+              className={`teach-tool${settingsOpen ? " is-on" : ""}`}
+              aria-label="Thickness and page options"
+              onClick={() => {
+                setSettingsOpen((open) => !open);
+                setBlankOpen(false);
+              }}
+            >
+              <SlidersIcon />
+            </button>
+            <button
+              type="button"
+              className={`teach-tool${thumbsOpen ? " is-on" : ""}`}
+              aria-label="Pages"
+              onClick={() => setThumbsOpen((open) => !open)}
+            >
+              <PagesIcon />
+            </button>
+            <button
+              type="button"
+              className={`teach-tool${padsHidden ? " is-on" : ""}`}
+              aria-label={padsHidden ? "Show header and tool pads" : "Hide header and tool pads"}
+              aria-pressed={padsHidden}
+              onClick={toggleFocus}
+            >
+              {padsHidden ? <Maximize2 size={18} /> : <Minimize2 size={18} />}
+            </button>
           </div>
-          <button
-            type="button"
-            className={`teach-tool${tool === "eraser" ? " is-on" : ""}`}
-            aria-label="Object eraser"
-            aria-pressed={tool === "eraser"}
-            onClick={() => setTool("eraser")}
-          >
-            <Eraser size={18} />
-          </button>
-          <button
-            type="button"
-            className={`teach-tool${tool === "scrub" ? " is-on" : ""}`}
-            aria-label="Pixel eraser"
-            aria-pressed={tool === "scrub"}
-            onClick={() => setTool("scrub")}
-          >
-            <PixelIcon />
-          </button>
-          {(tool === "eraser" || tool === "scrub") && (
-            <label className="eraser-size">
-              <span className="sr-only">{tool === "scrub" ? "Pixel eraser size" : "Object eraser size"}</span>
-              <input
-                type="range"
-                min={4}
-                max={48}
-                value={eraserSize}
-                onChange={(event) => setEraserSize(Number(event.target.value))}
-              />
-            </label>
-          )}
-          <button
-            type="button"
-            className={`teach-tool${tool === "laser" ? " is-on" : ""}`}
-            aria-label="Laser"
-            aria-pressed={tool === "laser"}
-            onClick={() => setTool("laser")}
-          >
-            <Crosshair size={18} />
-          </button>
-          <button
-            type="button"
-            className={`teach-tool${shapeDetect ? " is-on" : ""}`}
-            aria-label={shapeDetect ? "Shape detection on" : "Shape detection off"}
-            aria-pressed={shapeDetect}
-            onClick={() => {
-              setShapeDetect((on) => !on);
-              setTool("pen");
-            }}
-          >
-            <DetectIcon />
-          </button>
-          <button
-            type="button"
-            className={`teach-tool${tool === "line" ? " is-on" : ""}`}
-            aria-label="Line"
-            aria-pressed={tool === "line"}
-            onClick={() => setTool("line")}
-          >
-            <Slash size={18} />
-          </button>
-          <button
-            type="button"
-            className={`teach-tool${tool === "rect" ? " is-on" : ""}`}
-            aria-label="Rectangle"
-            aria-pressed={tool === "rect"}
-            onClick={() => setTool("rect")}
-          >
-            <Square size={18} />
-          </button>
-          <button
-            type="button"
-            className={`teach-tool${tool === "circle" ? " is-on" : ""}`}
-            aria-label="Circle"
-            aria-pressed={tool === "circle"}
-            onClick={() => setTool("circle")}
-          >
-            <Circle size={18} />
-          </button>
-          <button
-            type="button"
-            className={`teach-tool${tool === "arrow" ? " is-on" : ""}`}
-            aria-label="Arrow"
-            aria-pressed={tool === "arrow"}
-            onClick={() => setTool("arrow")}
-          >
-            <ArrowUpRight size={18} />
-          </button>
-          <button
-            type="button"
-            className={`teach-tool${tool === "text" ? " is-on" : ""}`}
-            aria-label="Text"
-            aria-pressed={tool === "text"}
-            onClick={() => setTool("text")}
-          >
-            <Type size={18} />
-          </button>
-          <button
-            type="button"
-            className={`teach-tool${tool === "highlighter" ? " is-on" : ""}`}
-            aria-label="Highlighter"
-            aria-pressed={tool === "highlighter"}
-            onClick={() => setTool("highlighter")}
-          >
-            <Highlighter size={18} />
-          </button>
-          <button
-            type="button"
-            className={`teach-tool${blankOpen ? " is-on" : ""}`}
-            aria-label="Add a blank page"
-            aria-pressed={blankOpen}
-            onClick={() => {
-              setBlankOpen((open) => !open);
-              setSettingsOpen(false);
-            }}
-          >
-            <FilePlus size={18} />
-          </button>
-          <button
-            type="button"
-            className="teach-tool"
-            aria-label="Add image, GIF, or video"
-            onClick={() => mediaRef.current?.click()}
-          >
-            <ImagePlus size={18} />
-          </button>
-          <button
-            type="button"
-            className={`teach-tool${settingsOpen ? " is-on" : ""}`}
-            aria-label="Thickness and page options"
-            onClick={() => {
-              setSettingsOpen((open) => !open);
-              setBlankOpen(false);
-            }}
-          >
-            <SlidersIcon />
-          </button>
-          <button
-            type="button"
-            className={`teach-tool${thumbsOpen ? " is-on" : ""}`}
-            aria-label="Pages"
-            onClick={() => setThumbsOpen((open) => !open)}
-          >
-            <PagesIcon />
-          </button>
-          <button
-            type="button"
-            className={`teach-tool${padsHidden ? " is-on" : ""}`}
-            aria-label={padsHidden ? "Show header and tool pads" : "Hide header and tool pads"}
-            aria-pressed={padsHidden}
-            onClick={() => setPadsHidden((hidden) => !hidden)}
-          >
-            <Minimize2 size={18} />
-          </button>
         </div>
 
         {settingsOpen && (
