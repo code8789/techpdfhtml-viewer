@@ -422,7 +422,14 @@ export function TeachApp() {
             aria-pressed={tool === "scrub"}
             onClick={() => setTool("scrub")}
           >
-            <PixelIcon />
+            <button
+            type="button"
+            onClick={() => {
+              // Your button action here
+            }}
+            className="..."
+          >
+            <Grid size={20} />
           </button>
           {(tool === "eraser" || tool === "scrub") && (
             <label className="eraser-size">
