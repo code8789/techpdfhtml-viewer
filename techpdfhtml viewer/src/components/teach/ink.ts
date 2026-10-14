@@ -282,7 +282,7 @@ export function snapShape(
   points: Pt[],
   style: { color: string; width: number; opacity: number },
 ): DrawObj | null {
-  if (points.length < 14) return null;
+  if (points.length < 12) return null;
   let length = 0;
   for (let i = 1; i < points.length; i++) {
     length += Math.hypot(points[i].x - points[i - 1].x, points[i].y - points[i - 1].y);
@@ -305,7 +305,7 @@ export function snapShape(
   const start = points[0];
   const end = points[points.length - 1];
   const gap = Math.hypot(end.x - start.x, end.y - start.y);
-  const closed = gap < Math.max(18, diag * 0.18);
+  const closed = gap < Math.max(24, diag * 0.22);
   let turns = 0;
   let prev: number | null = null;
   const step = Math.max(1, Math.floor(points.length / 28));
@@ -318,46 +318,89 @@ export function snapShape(
     }
     prev = ang;
   }
-  if (turns >= 7) return null;
-  if (!closed && turns >= 4) return null;
-  let dev = 0;
-  for (const p of points) dev = Math.max(dev, distToSeg(p.x, p.y, start.x, start.y, end.x, end.y));
-  const straight = dev / diag;
-  if (!closed && straight < 0.065 && turns <= 2) {
-    const cut = Math.max(1, Math.floor(points.length * 0.84));
-    let head = 0;
-    for (let i = cut; i < points.length; i++) {
-      head = Math.max(head, distToSeg(points[i].x, points[i].y, start.x, start.y, points[cut].x, points[cut].y));
+  if (turns >= 9) return null;
+
+  // --- LINE / ARROW ---
+  if (!closed && turns <= 3) {
+    let dev = 0;
+    for (const p of points) dev = Math.max(dev, distToSeg(p.x, p.y, start.x, start.y, end.x, end.y));
+    const straight = dev / diag;
+    if (straight < 0.07) {
+      const cut = Math.max(1, Math.floor(points.length * 0.84));
+      let head = 0;
+      for (let i = cut; i < points.length; i++) {
+        head = Math.max(
+          head,
+          distToSeg(points[i].x, points[i].y, start.x, start.y, points[cut].x, points[cut].y),
+        );
+      }
+      const main = Math.hypot(points[cut].x - start.x, points[cut].y - start.y) || 1;
+      if (head > Math.max(14, main * 0.14)) {
+        return { type: "arrow", x1: start.x, y1: start.y, x2: points[cut].x, y2: points[cut].y, ...style };
+      }
+      return { type: "line", x1: start.x, y1: start.y, x2: end.x, y2: end.y, ...style };
     }
-    const main = Math.hypot(points[cut].x - start.x, points[cut].y - start.y) || 1;
-    if (head > Math.max(14, main * 0.14)) {
-      return { type: "arrow", x1: start.x, y1: start.y, x2: points[cut].x, y2: points[cut].y, ...style };
-    }
-    return { type: "line", x1: start.x, y1: start.y, x2: end.x, y2: end.y, ...style };
   }
+
   if (!closed) return null;
+
   const cx = (x0 + x1) / 2;
   const cy = (y0 + y1) / 2;
   const rx = bw / 2 || 1;
   const ry = bh / 2 || 1;
+
+  // --- CIRCLE ---
   let err = 0;
   for (const p of points) {
     err += Math.abs(Math.hypot((p.x - cx) / rx, (p.y - cy) / ry) - 1);
   }
   err /= points.length;
   const aspect = Math.min(bw, bh) / Math.max(bw, bh);
-  if (err < 0.2 && turns <= 3 && aspect > 0.38) {
+  if (err < 0.22 && turns <= 4 && aspect > 0.4) {
     return { type: "circle", x: x0, y: y0, w: bw, h: bh, ...style };
   }
-  const tol = Math.max(8, diag * 0.075);
-  let edge = 0;
+
+  // --- RECTANGLE (improved) ---
+  // Count points that sit near each of the four bounding-box edges.
+  const tol = Math.max(10, diag * 0.09);
+  let onTop = 0;
+  let onBottom = 0;
+  let onLeft = 0;
+  let onRight = 0;
   for (const p of points) {
-    if (Math.abs(p.x - x0) < tol || Math.abs(p.x - x1) < tol || Math.abs(p.y - y0) < tol || Math.abs(p.y - y1) < tol) {
-      edge += 1;
-    }
+    // Point counts toward an edge only if it is close to that edge and inside the box.
+    const nearTop = Math.abs(p.y - y0) < tol;
+    const nearBottom = Math.abs(p.y - y1) < tol;
+    const nearLeft = Math.abs(p.x - x0) < tol;
+    const nearRight = Math.abs(p.x - x1) < tol;
+    if (nearTop) onTop += 1;
+    else if (nearBottom) onBottom += 1;
+    if (nearLeft) onLeft += 1;
+    else if (nearRight) onRight += 1;
   }
-  if (edge / points.length > 0.74 && turns >= 3 && turns <= 6) {
+  const edgeTop = onTop / points.length;
+  const edgeBottom = onBottom / points.length;
+  const edgeLeft = onLeft / points.length;
+  const edgeRight = onRight / points.length;
+  const minEdge = 0.14; // at least 14% of points must lie on each edge
+  const edgesPresent =
+    edgeTop > minEdge && edgeBottom > minEdge && edgeLeft > minEdge && edgeRight > minEdge;
+
+  // Count interior points (points that are not near any edge)
+  let interior = 0;
+  for (const p of points) {
+    const nearEdge =
+      Math.abs(p.x - x0) < tol ||
+      Math.abs(p.x - x1) < tol ||
+      Math.abs(p.y - y0) < tol ||
+      Math.abs(p.y - y1) < tol;
+    if (!nearEdge) interior += 1;
+  }
+  const interiorRatio = interior / points.length;
+
+  if (edgesPresent && interiorRatio < 0.35 && turns >= 2 && turns <= 8) {
     return { type: "rect", x: x0, y: y0, w: bw, h: bh, ...style };
   }
+
   return null;
 }
