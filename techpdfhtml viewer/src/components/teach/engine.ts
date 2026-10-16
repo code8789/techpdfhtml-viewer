@@ -127,7 +127,7 @@ type MediaHit = {
   page: Page;
   media: MediaObj;
   el: HTMLElement;
-  mode: MediaMode | null; // null => hit media body but not a specific handle yet
+  mode: MediaMode | null;
   isHandle: boolean;
 };
 
@@ -1186,13 +1186,18 @@ export class Engine {
     this.els.stage.style.gap = `${pad}px`;
   }
 
- private applyTransform() {
-  const R = this.visualRatio;
-  this.applyChromeSpace();
-  const idle = Math.abs(R - 1) < 0.001;
-  this.els.stage.style.transform = idle ? "" : `scale(${R})`;
-  this.els.stage.style.transformOrigin = "0 0";
-}
+  private applyTransform() {
+    const R = this.visualRatio;
+    this.applyChromeSpace();
+    const idle = Math.abs(R - 1) < 0.001;
+    if (idle) {
+      this.els.stage.style.transform = "";
+      this.els.stage.classList.remove("is-pinching");
+      this.els.sizer.style.width = "";
+      this.els.sizer.style.height = "";
+      this.els.sizer.style.minWidth = "";
+      return;
+    }
     this.els.stage.style.transform = `scale(${R})`;
     this.els.stage.style.transformOrigin = "0 0";
     this.els.stage.classList.add("is-pinching");
@@ -1351,7 +1356,10 @@ export class Engine {
         tile.canvas = canvas;
         tile.ctx = canvas.getContext("2d");
       }
-      const changed = false; // temporarily disabled
+      // Do not resize the ink canvas while a pinch is active. Resizing
+      // clears the bitmap for one frame, which is the visible flicker.
+      if (this.mode === "pinch") continue;
+      const changed = this.resizeInk(page, tile);
       if (changed || force) this.paintTile(page, tile);
     }
   }
@@ -1642,7 +1650,6 @@ export class Engine {
   }
 
   private mediaAt(x: number, y: number): MediaHit | null {
-    // Rotate handle has priority; then resize; then body.
     for (const el of document.elementsFromPoint(x, y)) {
       const item = el.closest(".media-item");
       if (!item) continue;
@@ -1650,8 +1657,10 @@ export class Engine {
       const page = shell ? this.pageByEl.get(shell) : undefined;
       const media = page?.media.find((m) => m.id === (item as HTMLElement).dataset.id);
       if (!page || !media) continue;
-      const inRotate = el instanceof HTMLElement && (el.dataset.role === "rotate" || !!el.closest(".media-rotate"));
-      const inHandle = el instanceof HTMLElement && (el.dataset.role === "handle" || !!el.closest(".media-handle"));
+      const inRotate =
+        el instanceof HTMLElement && (el.dataset.role === "rotate" || !!el.closest(".media-rotate"));
+      const inHandle =
+        el instanceof HTMLElement && (el.dataset.role === "handle" || !!el.closest(".media-handle"));
       const mode: MediaMode | null = inRotate ? "rotate" : inHandle ? "resize" : "move";
       return { page, media, el: item as HTMLElement, mode, isHandle: inHandle || inRotate };
     }
@@ -1687,8 +1696,6 @@ export class Engine {
     if (!this.doc) return;
     const prefs = this.hooks.getPrefs();
 
-    // If something is selected and user taps the rotate / resize handle,
-    // that takes priority over everything else.
     const hit = this.mediaAt(event.clientX, event.clientY);
     if (hit && this.selectedMediaId === hit.media.id && hit.mode && hit.isHandle) {
       this.beginMedia(hit, event, hit.mode);
@@ -1697,7 +1704,6 @@ export class Engine {
       return;
     }
 
-    // Deselect when tapping outside selected media (unless erasing it).
     if (this.selectedMediaId && (!hit || hit.media.id !== this.selectedMediaId)) {
       if (prefs.tool === "eraser" && hit) {
         this.snapshot(hit.page);
@@ -1722,10 +1728,6 @@ export class Engine {
       return;
     }
     if (hit && hit.mode === "move" && (prefs.tool === "hand" || this.selectedMediaId === hit.media.id)) {
-      // Video with hand tool and not selected: let native controls handle it.
-      if (hit.media.kind === "video" && prefs.tool === "hand" && this.selectedMediaId !== hit.media.id) {
-        // fall through to pan? No: treat as tap to select.
-      }
       this.selectMedia(hit.media.id);
       this.beginMedia(hit, event, "move");
       event.preventDefault();
@@ -2010,8 +2012,6 @@ export class Engine {
     scroll.scrollTop = layoutY * this.visualRatio - noy;
     this.lastMid = mid;
     this.hooks.onZoom(next);
-    // Do NOT trigger any re-render mid-pinch. The GPU scales the existing
-    // layers, and the re-raster waits for commitZoom after release.
   }
 
   private schedulePdfRerender() {
@@ -2208,7 +2208,6 @@ export class Engine {
       media.w = Math.max(28 / scale, drag.startW + (p.x - drag.anchorX));
       media.h = Math.max(28 / scale, drag.startH + (p.y - drag.anchorY));
     } else {
-      // rotate
       const centerBase = {
         x: media.x + media.w / 2,
         y: media.y + media.h / 2,
@@ -2225,7 +2224,6 @@ export class Engine {
     this.mediaDrag?.hit.el.classList.remove("is-on");
     if (this.mediaDrag) {
       const { hit } = this.mediaDrag;
-      // Keep the media selected after the drag so the handles remain visible.
       this.selectMedia(hit.media.id);
     }
     this.mediaDrag = null;
@@ -2307,7 +2305,7 @@ export class Engine {
   private async savePdf() {
     if (!this.doc) return;
     this.progress("Saving PDF…", 0.02, true);
-    const { PDFDocument, rgb, degrees } = await import("pdf-lib");
+    const { PDFDocument, rgb } = await import("pdf-lib");
     const original = this.pdfBlob ? await PDFDocument.load(await this.pdfBlob.arrayBuffer()) : null;
     const src = await PDFDocument.create();
     const total = this.doc.pages.length;
@@ -2337,86 +2335,88 @@ export class Engine {
       if (overlay) {
         const png = await src.embedPng(overlay.toDataURL("image/png"));
         pg.drawImage(png, { x: 0, y: 0, width: W, height: H });
-      } else for (const obj of page.objects) {
-        const [r, g, b] = hexRgb(objColor(obj));
-        const color = rgb(r, g, b);
-        const opacity = "opacity" in obj ? obj.opacity : 1;
-        if (obj.type === "stroke") {
-          for (let j = 1; j < obj.points.length; j++) {
-            const a = obj.points[j - 1];
-            const c = obj.points[j];
+      } else {
+        for (const obj of page.objects) {
+          const [r, g, b] = hexRgb(objColor(obj));
+          const color = rgb(r, g, b);
+          const opacity = "opacity" in obj ? obj.opacity : 1;
+          if (obj.type === "stroke") {
+            for (let j = 1; j < obj.points.length; j++) {
+              const a = obj.points[j - 1];
+              const c = obj.points[j];
+              pg.drawLine({
+                start: { x: a.x * sx, y: H - a.y * sy },
+                end: { x: c.x * sx, y: H - c.y * sy },
+                thickness: obj.width * sx,
+                color,
+                opacity,
+              });
+            }
+          } else if (obj.type === "line" || obj.type === "arrow") {
             pg.drawLine({
-              start: { x: a.x * sx, y: H - a.y * sy },
-              end: { x: c.x * sx, y: H - c.y * sy },
+              start: { x: obj.x1 * sx, y: H - obj.y1 * sy },
+              end: { x: obj.x2 * sx, y: H - obj.y2 * sy },
               thickness: obj.width * sx,
               color,
               opacity,
             });
-          }
-        } else if (obj.type === "line" || obj.type === "arrow") {
-          pg.drawLine({
-            start: { x: obj.x1 * sx, y: H - obj.y1 * sy },
-            end: { x: obj.x2 * sx, y: H - obj.y2 * sy },
-            thickness: obj.width * sx,
-            color,
-            opacity,
-          });
-          if (obj.type === "arrow") {
-            const ang = Math.atan2(obj.y2 - obj.y1, obj.x2 - obj.x1);
-            const len = Math.max(14, obj.width * 4);
-            const ax = obj.x2 - len * Math.cos(ang - 0.42);
-            const ay = obj.y2 - len * Math.sin(ang - 0.42);
-            const bx = obj.x2 - len * Math.cos(ang + 0.42);
-            const by = obj.y2 - len * Math.sin(ang + 0.42);
-            pg.drawLine({
-              start: { x: obj.x2 * sx, y: H - obj.y2 * sy },
-              end: { x: ax * sx, y: H - ay * sy },
-              thickness: obj.width * sx,
-              color,
+            if (obj.type === "arrow") {
+              const ang = Math.atan2(obj.y2 - obj.y1, obj.x2 - obj.x1);
+              const len = Math.max(14, obj.width * 4);
+              const ax = obj.x2 - len * Math.cos(ang - 0.42);
+              const ay = obj.y2 - len * Math.sin(ang - 0.42);
+              const bx = obj.x2 - len * Math.cos(ang + 0.42);
+              const by = obj.y2 - len * Math.sin(ang + 0.42);
+              pg.drawLine({
+                start: { x: obj.x2 * sx, y: H - obj.y2 * sy },
+                end: { x: ax * sx, y: H - ay * sy },
+                thickness: obj.width * sx,
+                color,
+                opacity,
+              });
+              pg.drawLine({
+                start: { x: obj.x2 * sx, y: H - obj.y2 * sy },
+                end: { x: bx * sx, y: H - by * sy },
+                thickness: obj.width * sx,
+                color,
+                opacity,
+              });
+            }
+          } else if (obj.type === "rect") {
+            const x = Math.min(obj.x, obj.x + obj.w);
+            const y = Math.min(obj.y, obj.y + obj.h);
+            pg.drawRectangle({
+              x: x * sx,
+              y: H - (y + Math.abs(obj.h)) * sy,
+              width: Math.abs(obj.w) * sx,
+              height: Math.abs(obj.h) * sy,
+              borderColor: color,
+              borderWidth: obj.width * sx,
               opacity,
             });
-            pg.drawLine({
-              start: { x: obj.x2 * sx, y: H - obj.y2 * sy },
-              end: { x: bx * sx, y: H - by * sy },
-              thickness: obj.width * sx,
-              color,
+          } else if (obj.type === "circle") {
+            pg.drawEllipse({
+              x: (obj.x + obj.w / 2) * sx,
+              y: H - (obj.y + obj.h / 2) * sy,
+              xScale: Math.abs(obj.w / 2) * sx,
+              yScale: Math.abs(obj.h / 2) * sy,
+              borderColor: color,
+              borderWidth: obj.width * sx,
               opacity,
             });
-          }
-        } else if (obj.type === "rect") {
-          const x = Math.min(obj.x, obj.x + obj.w);
-          const y = Math.min(obj.y, obj.y + obj.h);
-          pg.drawRectangle({
-            x: x * sx,
-            y: H - (y + Math.abs(obj.h)) * sy,
-            width: Math.abs(obj.w) * sx,
-            height: Math.abs(obj.h) * sy,
-            borderColor: color,
-            borderWidth: obj.width * sx,
-            opacity,
-          });
-        } else if (obj.type === "circle") {
-          pg.drawEllipse({
-            x: (obj.x + obj.w / 2) * sx,
-            y: H - (obj.y + obj.h / 2) * sy,
-            xScale: Math.abs(obj.w / 2) * sx,
-            yScale: Math.abs(obj.h / 2) * sy,
-            borderColor: color,
-            borderWidth: obj.width * sx,
-            opacity,
-          });
-        } else if (obj.type === "text") {
-          const safe = obj.text.replace(/[^\x20-\x7E]/g, "?");
-          try {
-            pg.drawText(safe, {
-              x: obj.x * sx,
-              y: H - obj.y * sy,
-              size: Math.max(8, obj.fontSize * sx),
-              color,
-              opacity,
-            });
-          } catch {
-            /* skip text the standard font cannot encode */
+          } else if (obj.type === "text") {
+            const safe = obj.text.replace(/[^\x20-\x7E]/g, "?");
+            try {
+              pg.drawText(safe, {
+                x: obj.x * sx,
+                y: H - obj.y * sy,
+                size: Math.max(8, obj.fontSize * sx),
+                color,
+                opacity,
+              });
+            } catch {
+              /* skip text the standard font cannot encode */
+            }
           }
         }
       }
@@ -2434,33 +2434,16 @@ export class Engine {
             c.getContext("2d")?.drawImage(bmp, 0, 0);
             image = await src.embedPng(c.toDataURL("image/png"));
           }
-          const rot = media.rotation ?? 0;
-          if (rot) {
-            // pdf-lib drawImage with rotation requires a bit of trig.
-            const rad = (rot * Math.PI) / 180;
-            const cx = media.x + media.w / 2;
-            const cy = media.y + media.h / 2;
-            // Draw centered, then use rotate + translate trick is not
-            // available here; approximate by drawing the same size.
-            const dw = Math.abs(media.w * Math.cos(rad)) + Math.abs(media.h * Math.sin(rad));
-            const dh = Math.abs(media.w * Math.sin(rad)) + Math.abs(media.h * Math.cos(rad));
-            const x0 = cx - dw / 2;
-            const y0 = cy - dh / 2;
-            pg.drawImage(image, {
-              x: x0 * sx,
-              y: H - (y0 + dh) * sy,
-              width: dw * sx,
-              height: dh * sy,
-              rotate: degrees(-rot),
-            });
-          } else {
-            pg.drawImage(image, {
-              x: media.x * sx,
-              y: H - (media.y + media.h) * sy,
-              width: media.w * sx,
-              height: media.h * sy,
-            });
-          }
+          // Draw media without baking rotation into the saved PDF. Rotation
+          // remains visible in-app and in the exported HTML; pdf-lib's
+          // image rotation API is version-dependent and we want a clean
+          // build on any pdf-lib version.
+          pg.drawImage(image, {
+            x: media.x * sx,
+            y: H - (media.y + media.h) * sy,
+            width: media.w * sx,
+            height: media.h * sy,
+          });
         } catch (err) {
           console.warn(err);
         }
