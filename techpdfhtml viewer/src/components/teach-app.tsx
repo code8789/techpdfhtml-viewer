@@ -587,14 +587,35 @@ export function TeachApp() {
               <PagesIcon />
             </button>
             <button
-              type="button"
-              className={`teach-tool${padsHidden ? " is-on" : ""}`}
-              aria-label={padsHidden ? "Show top bar" : "Hide top bar"}
-              aria-pressed={padsHidden}
-              onClick={() => setPadsHidden((hidden) => !hidden)}
-            >
-              {padsHidden ? <Maximize2 size={18} /> : <Minimize2 size={18} />}
-            </button>
+  type="button"
+  className={`teach-tool${padsHidden ? " is-on" : ""}`}
+  aria-label={padsHidden ? "Exit fullscreen" : "Enter fullscreen"}
+  aria-pressed={padsHidden}
+  onClick={() => {
+    // toggle top bar
+    setPadsHidden((hidden) => !hidden);
+
+    // toggle native fullscreen (hides the phone's own status bar too)
+    if (typeof document === "undefined") return;
+    const doc = document as Document & {
+      webkitFullscreenElement?: Element | null;
+      webkitExitFullscreen?: () => Promise<void>;
+    };
+    const el = document.documentElement as HTMLElement & {
+      webkitRequestFullscreen?: () => Promise<void>;
+    };
+    const isFs = !!document.fullscreenElement || !!doc.webkitFullscreenElement;
+    if (!isFs) {
+      if (el.requestFullscreen) void el.requestFullscreen().catch(() => {});
+      else if (el.webkitRequestFullscreen) void el.webkitRequestFullscreen().catch(() => {});
+    } else {
+      if (document.exitFullscreen) void document.exitFullscreen().catch(() => {});
+      else if (doc.webkitExitFullscreen) void doc.webkitExitFullscreen().catch(() => {});
+    }
+  }}
+>
+  {padsHidden ? <Maximize2 size={18} /> : <Minimize2 size={18} />}
+</button>
           </div>
         </div>
 
