@@ -182,10 +182,7 @@
   align-items: center;
   transform-origin: 0 0;
   background: #ffffff;
-  will-change: transform;          /* <-- delete this line */
-  backface-visibility: hidden;     /* <-- delete this line too */
-  -webkit-backface-visibility: hidden;  /* <-- and this */
-  transform: translateZ(0);        /* <-- and this */
+        
 }
 .page-shell {
   position: relative;
