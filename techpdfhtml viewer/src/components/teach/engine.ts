@@ -11,11 +11,11 @@ import {
 
 const TILE = 1800;
 const MIN_Z = 0.5;
-const MAX_Z = 20;                // was 5
+const MAX_Z = 20;
 const HISTORY = 40;
 const DOCK_GAP = 92;
 const MAX_EDGE = 2048;
-const MAX_CANVAS_EDGE = 8192;    // Safari canvas safety
+const MAX_CANVAS_EDGE = 8192;
 
 export type Tool =
   | "hand"
@@ -38,6 +38,7 @@ export type Prefs = {
   opacity: number;
   invert: boolean;
   shapeDetect: boolean;
+  laserSize: number;
 };
 
 export type TeachPatch = {
@@ -52,6 +53,7 @@ export type TeachPatch = {
   progress?: { label: string; ratio: number } | null;
   video?: boolean;
   ready?: boolean;
+  selectedMedia?: boolean;
 };
 
 export type TeachHooks = {
@@ -119,10 +121,13 @@ type Doc = {
   pages: Page[];
 };
 
+type MediaMode = "move" | "resize" | "rotate";
+
 type MediaHit = {
   page: Page;
   media: MediaObj;
   el: HTMLElement;
+  mode: MediaMode | null; // null => hit media body but not a specific handle yet
   isHandle: boolean;
 };
 
@@ -420,15 +425,18 @@ export class Engine {
   private lastTapX = 0;
   private lastTapY = 0;
   private draft: Draft | null = null;
+  private selectedMediaId: string | null = null;
   private mediaDrag: {
     hit: MediaHit;
-    mode: "move" | "resize";
+    mode: MediaMode;
     anchorX: number;
     anchorY: number;
     startX: number;
     startY: number;
     startW: number;
     startH: number;
+    startRot: number;
+    startAngle: number;
     moved: boolean;
     snap: boolean;
   } | null = null;
@@ -441,7 +449,7 @@ export class Engine {
   private wheelT = 0;
   private progLast = 0;
   private lastInvert = false;
-  private pinchRerenderTimer = 0;   // NEW: deferred reraster during pinch
+  private pinchRerenderTimer = 0;
 
   constructor(
     private els: StageEls,
@@ -504,6 +512,7 @@ export class Engine {
       if (this.doc?.kind === "pdf") this.mountVisible(true);
     }
     if (this.hooks.getPrefs().tool !== "hand") this.clearVideoFocus();
+    if (this.hooks.getPrefs().tool !== "hand") this.clearSelection();
     this.syncHistory();
   }
 
@@ -802,7 +811,7 @@ export class Engine {
     const w = Math.max(48, dims.w * k);
     const h = Math.max(48, dims.h * k);
     this.snapshot(page);
-    page.media.push({
+    const media: MediaObj = {
       id: uid(),
       kind,
       src: url,
@@ -810,9 +819,59 @@ export class Engine {
       y: this.visibleY(page),
       w,
       h,
-    });
+      rotation: 0,
+    };
+    page.media.push(media);
     this.syncMedia(page);
-    this.say(kind === "video" ? "Video added" : /gif$/i.test(file.type) || /\.gif$/i.test(file.name) ? "GIF added — it keeps animating" : "Image added");
+    this.selectMedia(media.id);
+    this.say(
+      kind === "video"
+        ? "Video added — drag / rotate / resize"
+        : /gif$/i.test(file.type) || /\.gif$/i.test(file.name)
+          ? "GIF added — drag / rotate / resize"
+          : "Image added — drag / rotate / resize",
+    );
+  }
+
+  deleteSelectedMedia() {
+    if (!this.selectedMediaId) return false;
+    for (const page of this.doc?.pages ?? []) {
+      const idx = page.media.findIndex((m) => m.id === this.selectedMediaId);
+      if (idx < 0) continue;
+      this.snapshot(page);
+      page.media.splice(idx, 1);
+      this.syncMedia(page);
+      this.clearSelection();
+      this.say("Removed");
+      return true;
+    }
+    return false;
+  }
+
+  clearSelection() {
+    if (!this.selectedMediaId) return;
+    this.selectedMediaId = null;
+    this.doc?.pages.forEach((p) => {
+      p.mediaLayer.querySelectorAll(".media-item.is-on").forEach((el) => el.classList.remove("is-on"));
+      p.mediaLayer.querySelectorAll(".media-handle, .media-rotate").forEach((el) => {
+        (el as HTMLElement).style.display = "none";
+      });
+    });
+    this.patch({ selectedMedia: false });
+  }
+
+  private selectMedia(id: string | null) {
+    this.selectedMediaId = id;
+    this.doc?.pages.forEach((p) => {
+      p.mediaLayer.querySelectorAll<HTMLElement>(".media-item").forEach((el) => {
+        const on = el.dataset.id === id;
+        el.classList.toggle("is-on", on);
+        el.querySelectorAll<HTMLElement>(".media-handle, .media-rotate").forEach((h) => {
+          h.style.display = on ? "" : "none";
+        });
+      });
+    });
+    this.patch({ selectedMedia: !!id });
   }
 
   async save() {
@@ -1067,6 +1126,7 @@ export class Engine {
     this.htmlObserver?.disconnect();
     this.htmlObserver = null;
     this.clearVideoFocus();
+    this.selectedMediaId = null;
     try {
       this.pdf?.destroy();
     } catch {
@@ -1083,6 +1143,7 @@ export class Engine {
     this.draft = null;
     this.els.stage.replaceChildren();
     this.els.stage.style.transform = "";
+    this.els.stage.classList.remove("is-pinching");
     this.els.sizer.style.width = "";
     this.els.sizer.style.height = "";
   }
@@ -1129,14 +1190,17 @@ export class Engine {
     const R = this.visualRatio;
     this.applyChromeSpace();
     const idle = Math.abs(R - 1) < 0.001;
-    this.els.stage.style.transform = idle ? "" : `scale(${R})`;
-    this.els.stage.style.transformOrigin = "0 0";
     if (idle) {
+      this.els.stage.style.transform = "";
+      this.els.stage.classList.remove("is-pinching");
       this.els.sizer.style.width = "";
       this.els.sizer.style.height = "";
       this.els.sizer.style.minWidth = "";
       return;
     }
+    this.els.stage.style.transform = `scale(${R})`;
+    this.els.stage.style.transformOrigin = "0 0";
+    this.els.stage.classList.add("is-pinching");
     this.els.sizer.style.minWidth = "0px";
     this.els.sizer.style.width = `${this.els.stage.offsetWidth * R}px`;
     this.els.sizer.style.height = `${this.els.stage.offsetHeight * R + DOCK_GAP}px`;
@@ -1185,6 +1249,7 @@ export class Engine {
     this.mountVisible(true);
     this.hooks.onZoom(next);
     this.patch({ zoom: next });
+    this.schedulePdfRerender();
   }
 
   private commitZoom() {
@@ -1203,9 +1268,11 @@ export class Engine {
     this.layout();
     scroll.scrollLeft = layoutX * applied - ox;
     scroll.scrollTop = layoutY * applied - oy;
+    this.els.stage.classList.remove("is-pinching");
     this.mountVisible(true);
     this.hooks.onZoom(this.userZoom);
     this.patch({ zoom: this.userZoom });
+    this.schedulePdfRerender();
   }
 
   private near(el: HTMLElement, margin: number) {
@@ -1455,6 +1522,7 @@ export class Engine {
       canUndo: false,
       canRedo: false,
       progress: null,
+      selectedMedia: false,
     });
     this.hooks.onZoom(this.userZoom);
   }
@@ -1492,6 +1560,10 @@ export class Engine {
   private syncMedia(page: Page) {
     page.mediaLayer.replaceChildren();
     for (const media of page.media) page.mediaLayer.appendChild(this.mediaNode(media));
+    if (this.selectedMediaId) {
+      const present = page.media.some((m) => m.id === this.selectedMediaId);
+      this.selectMedia(present ? this.selectedMediaId : null);
+    }
   }
 
   private mediaNode(media: MediaObj) {
@@ -1502,6 +1574,7 @@ export class Engine {
     el.style.top = `${media.y}px`;
     el.style.width = `${media.w}px`;
     el.style.height = `${media.h}px`;
+    el.style.setProperty("--rot", `${media.rotation ?? 0}deg`);
     if (media.kind === "video") {
       const video = document.createElement("video");
       video.src = media.src;
@@ -1521,6 +1594,14 @@ export class Engine {
     handle.className = "media-handle";
     handle.dataset.role = "handle";
     el.appendChild(handle);
+    const rotate = document.createElement("span");
+    rotate.className = "media-rotate";
+    rotate.dataset.role = "rotate";
+    el.appendChild(rotate);
+    const selected = this.selectedMediaId === media.id;
+    el.classList.toggle("is-on", selected);
+    handle.style.display = selected ? "" : "none";
+    rotate.style.display = selected ? "" : "none";
     return el;
   }
 
@@ -1529,6 +1610,7 @@ export class Engine {
     el.style.top = `${media.y}px`;
     el.style.width = `${media.w}px`;
     el.style.height = `${media.h}px`;
+    el.style.setProperty("--rot", `${media.rotation ?? 0}deg`);
   }
 
   private visibleY(page: Page) {
@@ -1565,6 +1647,7 @@ export class Engine {
   }
 
   private mediaAt(x: number, y: number): MediaHit | null {
+    // Rotate handle has priority; then resize; then body.
     for (const el of document.elementsFromPoint(x, y)) {
       const item = el.closest(".media-item");
       if (!item) continue;
@@ -1572,8 +1655,10 @@ export class Engine {
       const page = shell ? this.pageByEl.get(shell) : undefined;
       const media = page?.media.find((m) => m.id === (item as HTMLElement).dataset.id);
       if (!page || !media) continue;
-      const isHandle = el instanceof HTMLElement && (el.dataset.role === "handle" || !!el.closest(".media-handle"));
-      return { page, media, el: item as HTMLElement, isHandle };
+      const inRotate = el instanceof HTMLElement && (el.dataset.role === "rotate" || !!el.closest(".media-rotate"));
+      const inHandle = el instanceof HTMLElement && (el.dataset.role === "handle" || !!el.closest(".media-handle"));
+      const mode: MediaMode | null = inRotate ? "rotate" : inHandle ? "resize" : "move";
+      return { page, media, el: item as HTMLElement, mode, isHandle: inHandle || inRotate };
     }
     return null;
   }
@@ -1606,31 +1691,60 @@ export class Engine {
     this.stopMomentum();
     if (!this.doc) return;
     const prefs = this.hooks.getPrefs();
-    const media = this.mediaAt(event.clientX, event.clientY);
-    if (media && prefs.tool === "eraser") {
-      this.snapshot(media.page);
-      media.page.media = media.page.media.filter((m) => m.id !== media.media.id);
-      this.syncMedia(media.page);
+
+    // If something is selected and user taps the rotate / resize handle,
+    // that takes priority over everything else.
+    const hit = this.mediaAt(event.clientX, event.clientY);
+    if (hit && this.selectedMediaId === hit.media.id && hit.mode && hit.isHandle) {
+      this.beginMedia(hit, event, hit.mode);
+      event.preventDefault();
+      capture();
+      return;
+    }
+
+    // Deselect when tapping outside selected media (unless erasing it).
+    if (this.selectedMediaId && (!hit || hit.media.id !== this.selectedMediaId)) {
+      if (prefs.tool === "eraser" && hit) {
+        this.snapshot(hit.page);
+        hit.page.media = hit.page.media.filter((m) => m.id !== hit.media.id);
+        this.syncMedia(hit.page);
+        this.clearSelection();
+        this.say("Removed");
+        event.preventDefault();
+        capture();
+        return;
+      }
+      this.clearSelection();
+    }
+
+    if (prefs.tool === "eraser" && hit) {
+      this.snapshot(hit.page);
+      hit.page.media = hit.page.media.filter((m) => m.id !== hit.media.id);
+      this.syncMedia(hit.page);
       this.say("Removed");
       event.preventDefault();
       capture();
       return;
     }
-    if (media?.isHandle) {
-      this.beginMedia(media, event, "resize");
+    if (hit && hit.mode === "move" && (prefs.tool === "hand" || this.selectedMediaId === hit.media.id)) {
+      // Video with hand tool and not selected: let native controls handle it.
+      if (hit.media.kind === "video" && prefs.tool === "hand" && this.selectedMediaId !== hit.media.id) {
+        // fall through to pan? No: treat as tap to select.
+      }
+      this.selectMedia(hit.media.id);
+      this.beginMedia(hit, event, "move");
       event.preventDefault();
       capture();
       return;
     }
-    if (media && media.media.kind === "video" && prefs.tool === "hand") {
-      return;
-    }
-    if (media && prefs.tool === "hand" && media.media.kind === "image") {
-      this.beginMedia(media, event, "move");
+    if (hit && prefs.tool === "hand" && hit.media.kind === "image") {
+      this.selectMedia(hit.media.id);
+      this.beginMedia(hit, event, "move");
       event.preventDefault();
       capture();
       return;
     }
+
     if (prefs.tool === "hand") {
       this.beginPan(event);
       event.preventDefault();
@@ -1679,13 +1793,7 @@ export class Engine {
         page,
         origin: this.toBase(page, event.clientX, event.clientY),
         moved: true,
-        obj: {
-          type: "stroke",
-          points: [],
-          color: "#000",
-          width: 1,
-          opacity: 1,
-        },
+        obj: { type: "stroke", points: [], color: "#000", width: 1, opacity: 1 },
       };
       this.eraseAt(page, event.clientX, event.clientY);
       event.preventDefault();
@@ -1735,7 +1843,6 @@ export class Engine {
         this.mode = "none";
         this.blockUntilUp = this.pointers.size > 0;
         this.commitZoom();
-        this.schedulePdfRerender();
       }
       return;
     }
@@ -1780,10 +1887,7 @@ export class Engine {
     scroll.scrollTop = layoutY * this.visualRatio - oy;
     this.hooks.onZoom(next);
     window.clearTimeout(this.wheelT);
-    this.wheelT = window.setTimeout(() => {
-      this.commitZoom();
-      this.schedulePdfRerender();
-    }, 160);
+    this.wheelT = window.setTimeout(() => this.commitZoom(), 160);
   };
 
   private onScroll = () => {
@@ -1814,9 +1918,15 @@ export class Engine {
     } else if (meta && event.key.toLowerCase() === "y") {
       event.preventDefault();
       this.redo();
+    } else if (event.key === "Backspace" || event.key === "Delete") {
+      if (this.deleteSelectedMedia()) event.preventDefault();
     } else if (event.key === "Escape") {
-      this.clearVideoFocus();
-      this.hooks.onEscape();
+      if (this.selectedMediaId) {
+        this.clearSelection();
+      } else {
+        this.clearVideoFocus();
+        this.hooks.onEscape();
+      }
     }
   };
 
@@ -1905,10 +2015,10 @@ export class Engine {
     scroll.scrollTop = layoutY * this.visualRatio - noy;
     this.lastMid = mid;
     this.hooks.onZoom(next);
-    this.schedulePdfRerender();
+    // Do NOT trigger any re-render mid-pinch. The GPU scales the existing
+    // layers, and the re-raster waits for commitZoom after release.
   }
 
-  /** NEW: debounce heavy PDF reraster while user is still pinching */
   private schedulePdfRerender() {
     if (!this.doc || this.doc.kind !== "pdf") return;
     window.clearTimeout(this.pinchRerenderTimer);
@@ -1918,7 +2028,7 @@ export class Engine {
       for (const page of this.doc.pages) {
         if (page.mounted && page.pdfCanvas) void this.renderPdf(page);
       }
-    }, 220);
+    }, 180);
   }
 
   private beginShape(page: Page, tool: Tool, event: PointerEvent) {
@@ -2016,12 +2126,18 @@ export class Engine {
       Math.max(12, (this.hooks.getPrefs().eraserSize || 14) * 1.25) / Math.max(0.05, this.displayScale());
     for (let i = page.media.length - 1; i >= 0; i--) {
       const media = page.media[i];
-      if (p.x < media.x - radius || p.x > media.x + media.w + radius || p.y < media.y - radius || p.y > media.y + media.h + radius) {
+      if (
+        p.x < media.x - radius ||
+        p.x > media.x + media.w + radius ||
+        p.y < media.y - radius ||
+        p.y > media.y + media.h + radius
+      ) {
         continue;
       }
       this.snapshot(page);
       page.media.splice(i, 1);
       this.syncMedia(page);
+      this.clearSelection();
       return;
     }
     for (let i = page.objects.length - 1; i >= 0; i--) {
@@ -2054,8 +2170,13 @@ export class Engine {
     this.paintPage(page);
   }
 
-  private beginMedia(hit: MediaHit, event: PointerEvent, mode: "move" | "resize") {
+  private beginMedia(hit: MediaHit, event: PointerEvent, mode: MediaMode) {
     const p = this.toBase(hit.page, event.clientX, event.clientY);
+    const centerBase = {
+      x: hit.media.x + hit.media.w / 2,
+      y: hit.media.y + hit.media.h / 2,
+    };
+    const startAngle = Math.atan2(p.y - centerBase.y, p.x - centerBase.x) * (180 / Math.PI);
     this.mode = "media";
     this.mediaDrag = {
       hit,
@@ -2066,6 +2187,8 @@ export class Engine {
       startY: hit.media.y,
       startW: hit.media.w,
       startH: hit.media.h,
+      startRot: hit.media.rotation ?? 0,
+      startAngle,
       moved: false,
       snap: false,
     };
@@ -2081,29 +2204,46 @@ export class Engine {
       drag.snap = true;
     }
     drag.moved = true;
+    const media = drag.hit.media;
     if (drag.mode === "move") {
-      drag.hit.media.x = clamp(drag.startX + (p.x - drag.anchorX), -20, drag.hit.page.baseW - 20);
-      drag.hit.media.y = clamp(drag.startY + (p.y - drag.anchorY), -20, drag.hit.page.baseH - 20);
-    } else {
+      media.x = clamp(drag.startX + (p.x - drag.anchorX), -20, drag.hit.page.baseW - 20);
+      media.y = clamp(drag.startY + (p.y - drag.anchorY), -20, drag.hit.page.baseH - 20);
+    } else if (drag.mode === "resize") {
       const scale = Math.max(0.05, this.displayScale());
-      drag.hit.media.w = Math.max(28 / scale, drag.startW + (p.x - drag.anchorX));
-      drag.hit.media.h = Math.max(28 / scale, drag.startH + (p.y - drag.anchorY));
+      media.w = Math.max(28 / scale, drag.startW + (p.x - drag.anchorX));
+      media.h = Math.max(28 / scale, drag.startH + (p.y - drag.anchorY));
+    } else {
+      // rotate
+      const centerBase = {
+        x: media.x + media.w / 2,
+        y: media.y + media.h / 2,
+      };
+      const ang = Math.atan2(p.y - centerBase.y, p.x - centerBase.x) * (180 / Math.PI);
+      let next = drag.startRot + (ang - drag.startAngle);
+      if (event.shiftKey) next = Math.round(next / 15) * 15;
+      media.rotation = ((next % 360) + 360) % 360;
     }
-    this.placeMedia(drag.hit.el, drag.hit.media);
+    this.placeMedia(drag.hit.el, media);
   }
 
   private finishMedia() {
     this.mediaDrag?.hit.el.classList.remove("is-on");
-    if (this.mediaDrag && !this.mediaDrag.snap && this.mediaDrag.hit.page.past.length) {
-      /* no snapshot was stored */
+    if (this.mediaDrag) {
+      const { hit } = this.mediaDrag;
+      // Keep the media selected after the drag so the handles remain visible.
+      this.selectMedia(hit.media.id);
     }
     this.mediaDrag = null;
   }
 
   private moveLaser(x: number, y: number) {
+    const size = this.hooks.getPrefs().laserSize || 18;
     this.laser.style.display = "block";
     this.laser.style.left = `${x}px`;
     this.laser.style.top = `${y}px`;
+    this.laser.style.width = `${size}px`;
+    this.laser.style.height = `${size}px`;
+    this.laser.style.margin = `${-size / 2}px 0 0 ${-size / 2}px`;
   }
 
   private hideLaser() {
@@ -2172,7 +2312,7 @@ export class Engine {
   private async savePdf() {
     if (!this.doc) return;
     this.progress("Saving PDF…", 0.02, true);
-    const { PDFDocument, rgb } = await import("pdf-lib");
+    const { PDFDocument, rgb, degrees } = await import("pdf-lib");
     const original = this.pdfBlob ? await PDFDocument.load(await this.pdfBlob.arrayBuffer()) : null;
     const src = await PDFDocument.create();
     const total = this.doc.pages.length;
@@ -2299,12 +2439,33 @@ export class Engine {
             c.getContext("2d")?.drawImage(bmp, 0, 0);
             image = await src.embedPng(c.toDataURL("image/png"));
           }
-          pg.drawImage(image, {
-            x: media.x * sx,
-            y: H - (media.y + media.h) * sy,
-            width: media.w * sx,
-            height: media.h * sy,
-          });
+          const rot = media.rotation ?? 0;
+          if (rot) {
+            // pdf-lib drawImage with rotation requires a bit of trig.
+            const rad = (rot * Math.PI) / 180;
+            const cx = media.x + media.w / 2;
+            const cy = media.y + media.h / 2;
+            // Draw centered, then use rotate + translate trick is not
+            // available here; approximate by drawing the same size.
+            const dw = Math.abs(media.w * Math.cos(rad)) + Math.abs(media.h * Math.sin(rad));
+            const dh = Math.abs(media.w * Math.sin(rad)) + Math.abs(media.h * Math.cos(rad));
+            const x0 = cx - dw / 2;
+            const y0 = cy - dh / 2;
+            pg.drawImage(image, {
+              x: x0 * sx,
+              y: H - (y0 + dh) * sy,
+              width: dw * sx,
+              height: dh * sy,
+              rotate: degrees(-rot),
+            });
+          } else {
+            pg.drawImage(image, {
+              x: media.x * sx,
+              y: H - (media.y + media.h) * sy,
+              width: media.w * sx,
+              height: media.h * sy,
+            });
+          }
         } catch (err) {
           console.warn(err);
         }
@@ -2335,8 +2496,11 @@ export class Engine {
       else if (src.startsWith("blob:")) continue;
       const tag = media.kind === "video" ? "video" : "img";
       const extra = media.kind === "video" ? " controls playsinline" : "";
+      const rot = media.rotation ?? 0;
+      const tx = media.x + media.w / 2;
+      const ty = media.y + media.h / 2;
       clips.push(
-        `<${tag} src="${src}"${extra} style="position:absolute;left:${media.x}px;top:${media.y}px;width:${media.w}px;height:${media.h}px"></${tag}>`,
+        `<${tag} src="${src}"${extra} style="position:absolute;left:0;top:0;width:${media.w}px;height:${media.h}px;transform:translate(${tx - media.w / 2}px, ${ty - media.h / 2}px) rotate(${rot}deg);transform-origin:${media.w / 2}px ${media.h / 2}px"></${tag}>`,
       );
     }
     const block = `<style id="teachpdf-annot-style">#teachpdf-annot{position:absolute;left:0;top:0;width:${page.baseW}px;height:${page.baseH}px;pointer-events:none;z-index:2147483000}</style><div id="teachpdf-annot"><svg width="${page.baseW}" height="${page.baseH}" viewBox="0 0 ${page.baseW} ${page.baseH}">${svg}</svg>${clips.join("")}</div><!--teachpdf-annot-end-->`;
@@ -2344,7 +2508,11 @@ export class Engine {
     else html += block;
     downloadBlob(new Blob([html], { type: "text/html" }), `${this.docName}_annotated.html`);
     this.patch({ progress: null });
-    this.say(clips.length < page.media.length ? "HTML saved. A very large clip was left out so the phone stays stable." : "HTML saved — animation kept");
+    this.say(
+      clips.length < page.media.length
+        ? "HTML saved. A very large clip was left out so the phone stays stable."
+        : "HTML saved — animation kept",
+    );
   }
 
   private async inlineBlobs(html: string) {
