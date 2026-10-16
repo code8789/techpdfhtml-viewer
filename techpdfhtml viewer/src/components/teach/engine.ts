@@ -1984,7 +1984,7 @@ export class Engine {
     this.momentum = 0;
   }
 
-  private movePinch() {
+    private movePinch() {
     const pts = [...this.pointers.values()];
     if (pts.length < 2) return;
     const dist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y) || 1;
@@ -2000,6 +2000,9 @@ export class Engine {
     this.userZoom = next;
     this.visualRatio = next / this.committedZoom;
     this.applyTransform();
+    // Pinch keeps the visual midpoint anchored. This DOES touch scrollTop /
+    // scrollLeft, but does NOT touch the sizer's width/height — which is
+    // what caused the re-layout flash.
     const nox = mid.x - rect.left;
     const noy = mid.y - rect.top;
     scroll.scrollLeft = layoutX * this.visualRatio - nox;
