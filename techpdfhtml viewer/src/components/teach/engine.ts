@@ -1187,7 +1187,7 @@ export class Engine {
     this.els.stage.style.gap = `${pad}px`;
   }
 
-    private applyTransform() {
+  private applyTransform() {
     const R = this.visualRatio;
     this.applyChromeSpace();
     const idle = Math.abs(R - 1) < 0.001;
@@ -1985,7 +1985,7 @@ export class Engine {
     this.momentum = 0;
   }
 
-    private movePinch() {
+  private movePinch() {
     const pts = [...this.pointers.values()];
     if (pts.length < 2) return;
     const dist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y) || 1;
@@ -2001,9 +2001,6 @@ export class Engine {
     this.userZoom = next;
     this.visualRatio = next / this.committedZoom;
     this.applyTransform();
-    // Pinch keeps the visual midpoint anchored. This DOES touch scrollTop /
-    // scrollLeft, but does NOT touch the sizer's width/height — which is
-    // what caused the re-layout flash.
     const nox = mid.x - rect.left;
     const noy = mid.y - rect.top;
     scroll.scrollLeft = layoutX * this.visualRatio - nox;
@@ -2066,7 +2063,7 @@ export class Engine {
         obj.x2 = q.x;
         obj.y2 = q.y;
         this.draft.moved = Math.hypot(obj.x2 - obj.x1, obj.y2 - obj.y1) > 1.5;
-      } else if (obj.type === "rect" || obj.type === "circle") {
+      } else if (obj.type === "rect" || obj.type === "circle" || obj.type === "triangle") {
         obj.x = this.draft.origin.x;
         obj.y = this.draft.origin.y;
         obj.w = q.x - this.draft.origin.x;
@@ -2380,7 +2377,7 @@ export class Engine {
                 opacity,
               });
             }
-                    } else if (obj.type === "rect") {
+          } else if (obj.type === "rect") {
             const x = Math.min(obj.x, obj.x + obj.w);
             const y = Math.min(obj.y, obj.y + obj.h);
             pg.drawRectangle({
@@ -2403,7 +2400,7 @@ export class Engine {
               opacity,
             });
           } else if (obj.type === "triangle") {
-            const [a, b2, c] = (() => {
+            const tri = (() => {
               const x0 = Math.min(obj.x, obj.x + obj.w);
               const y0 = Math.min(obj.y, obj.y + obj.h);
               const x1 = Math.max(obj.x, obj.x + obj.w);
@@ -2415,9 +2412,9 @@ export class Engine {
               ];
             })();
             const pts: [number, number][] = [
-              [a.x * sx, H - a.y * sy],
-              [b2.x * sx, H - b2.y * sy],
-              [c.x * sx, H - c.y * sy],
+              [tri[0].x * sx, H - tri[0].y * sy],
+              [tri[1].x * sx, H - tri[1].y * sy],
+              [tri[2].x * sx, H - tri[2].y * sy],
             ];
             for (let k = 0; k < 3; k++) {
               const p1 = pts[k];
@@ -2460,10 +2457,6 @@ export class Engine {
             c.getContext("2d")?.drawImage(bmp, 0, 0);
             image = await src.embedPng(c.toDataURL("image/png"));
           }
-          // Draw media without baking rotation into the saved PDF. Rotation
-          // remains visible in-app and in the exported HTML; pdf-lib's
-          // image rotation API is version-dependent and we want a clean
-          // build on any pdf-lib version.
           pg.drawImage(image, {
             x: media.x * sx,
             y: H - (media.y + media.h) * sy,
