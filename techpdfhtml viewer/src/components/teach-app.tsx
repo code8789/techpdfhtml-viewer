@@ -83,13 +83,6 @@ const Stage = memo(function Stage({
   );
 });
 
-/**
- * Toggle browser-native fullscreen.
- * On Android Chrome this hides the phone's own status bar.
- * On iPhone Safari this is a no-op (iOS does not support it on
- * non-video elements) — the CSS-based focus mode still hides the
- * app's top bar in that case.
- */
 function toggleNativeFullscreen() {
   if (typeof document === "undefined") return;
   const doc = document as Document & {
@@ -252,15 +245,12 @@ export function TeachApp() {
   }
 
   function enterFocusMode() {
-    // 1) hide the app's own top bar (works everywhere, including iPhone)
     setPadsHidden(true);
-    // 2) ask the browser for true fullscreen (hides Android status bar too)
     toggleNativeFullscreen();
   }
 
   function exitFocusMode() {
     setPadsHidden(false);
-    // If the browser is still in native fullscreen, leave it.
     if (typeof document === "undefined") return;
     const doc = document as Document & {
       webkitFullscreenElement?: Element | null;
@@ -566,7 +556,8 @@ export function TeachApp() {
               onClick={() => setTool("circle")}
             >
               <Circle size={18} />
-                          <button
+            </button>
+            <button
               type="button"
               className={`teach-tool${tool === "triangle" ? " is-on" : ""}`}
               aria-label="Triangle"
@@ -574,7 +565,6 @@ export function TeachApp() {
               onClick={() => setTool("triangle")}
             >
               <TriangleIcon />
-            </button>
             </button>
             <button
               type="button"
@@ -822,6 +812,8 @@ export function TeachApp() {
   );
 }
 
+/* ---------- Icon helpers (exactly one of each) ---------- */
+
 function SlidersIcon() {
   return (
     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
@@ -852,14 +844,6 @@ function PixelIcon() {
   );
 }
 
-function DetectIcon() {
-  return (
-    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
-      <path d="M3 7V5a2 2 0 0 1 2-2h2M17 3h2a2 2 0 0 1 2 2v2M21 17v2a2 2 0 0 1-2 2h-2M7 21H5a2 2 0 0 1-2-2v-2" />
-      <circle cx="12" cy="12" r="3" />
-    </svg>
-  );
-}
 function DetectIcon() {
   return (
     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
