@@ -14,7 +14,7 @@ const MIN_Z = 0.5;
 const MAX_Z = 20;
 const HISTORY = 40;
 const DOCK_GAP = 92;
-const MAX_EDGE = 2048;
+const MAX_EDGE = 1536;
 const MAX_CANVAS_EDGE = 8192;
 
 export type Tool =
