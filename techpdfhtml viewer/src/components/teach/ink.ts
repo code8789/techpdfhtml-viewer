@@ -57,6 +57,7 @@ export type MediaObj = {
   y: number;
   w: number;
   h: number;
+  rotation?: number; // degrees, clockwise, about the media's center
 };
 
 export const COLORS = [
@@ -278,16 +279,17 @@ export function objSvg(o: DrawObj) {
   return `<text x="${r2(o.x)}" y="${r2(o.y)}" fill="${o.color}" font-size="${r2(o.fontSize)}" font-family="Source Sans 3, sans-serif" opacity="${op}">${xmlText(o.text)}</text>`;
 }
 
-export function snapShape(
-  points: Pt[],
-  style: { color: string; width: number; opacity: number },
-): DrawObj | null {
-  if (points.length < 12) return null;
-  let length = 0;
-  for (let i = 1; i < points.length; i++) {
-    length += Math.hypot(points[i].x - points[i - 1].x, points[i].y - points[i - 1].y);
-  }
-  if (length < 40) return null;
+/* -------------------------------------------------------------------------- */
+/*  SHAPE DETECTION                                                           */
+/*                                                                            */
+/*  Order matters: line/arrow -> RECTANGLE -> circle/ellipse.                 */
+/*  Testing rectangle before circle is what makes hand-drawn rectangles       */
+/*  reliably classified as rect instead of circle.                            */
+/* -------------------------------------------------------------------------- */
+
+type Bounds = { x0: number; y0: number; x1: number; y1: number };
+
+function boundingBox(points: Pt[]): Bounds {
   let x0 = Infinity;
   let y0 = Infinity;
   let x1 = -Infinity;
@@ -298,14 +300,81 @@ export function snapShape(
     x1 = Math.max(x1, p.x);
     y1 = Math.max(y1, p.y);
   }
-  const bw = x1 - x0;
-  const bh = y1 - y0;
+  return { x0, y0, x1, y1 };
+}
+
+/**
+ * Detects a rectangle: every point must be near one of the 4 bounding-box
+ * edges (within `tol`), and no point may sit deep in the interior.
+ * Hand-drawn circles fail this because their left and right extremes are
+ * smooth arcs, so many points fall well inside the bbox horizontally.
+ */
+function isRectangle(points: Pt[], b: Bounds): boolean {
+  const bw = b.x1 - b.x0;
+  const bh = b.y1 - b.y0;
+  const diag = Math.hypot(bw, bh);
+  if (diag < 30) return false;
+  // Keep the tolerance tight: a wobbly hand-drawn line should still count.
+  const tol = Math.max(6, diag * 0.08);
+  let onPerimeter = 0;
+  for (const p of points) {
+    const nearV = Math.abs(p.x - b.x0) < tol || Math.abs(p.x - b.x1) < tol;
+    const nearH = Math.abs(p.y - b.y0) < tol || Math.abs(p.y - b.y1) < tol;
+    if (nearV || nearH) onPerimeter++;
+    else return false; // any point truly inside disqualifies -> rectangle
+  }
+  // Require almost all points to hug the perimeter.
+  return onPerimeter / points.length > 0.9;
+}
+
+/**
+ * Detects a circle/ellipse. We deliberately require a high aspect ratio
+ * (so squat rectangles cannot pass) and a tight normalized radius error.
+ */
+function isCircle(points: Pt[], b: Bounds): boolean {
+  const bw = b.x1 - b.x0;
+  const bh = b.y1 - b.y0;
+  if (bw < 20 || bh < 20) return false;
+  const aspect = Math.min(bw, bh) / Math.max(bw, bh);
+  if (aspect < 0.6) return false; // too rectangular to be a circle
+  const cx = (b.x0 + b.x1) / 2;
+  const cy = (b.y0 + b.y1) / 2;
+  const rx = bw / 2 || 1;
+  const ry = bh / 2 || 1;
+  let err = 0;
+  for (const p of points) {
+    err += Math.abs(Math.hypot((p.x - cx) / rx, (p.y - cy) / ry) - 1);
+  }
+  err /= points.length;
+  // 0.13 is strict enough that a rectangle is rejected, loose enough for
+  // a hand-drawn circle. Bump to 0.16 if circles are missed.
+  return err < 0.13;
+}
+
+export function snapShape(
+  points: Pt[],
+  style: { color: string; width: number; opacity: number },
+): DrawObj | null {
+  if (points.length < 12) return null;
+  let length = 0;
+  for (let i = 1; i < points.length; i++) {
+    length += Math.hypot(points[i].x - points[i - 1].x, points[i].y - points[i - 1].y);
+  }
+  if (length < 40) return null;
+
+  const b = boundingBox(points);
+  const bw = b.x1 - b.x0;
+  const bh = b.y1 - b.y0;
   const diag = Math.hypot(bw, bh) || 1;
   if (diag < 30) return null;
+
   const start = points[0];
   const end = points[points.length - 1];
   const gap = Math.hypot(end.x - start.x, end.y - start.y);
-  const closed = gap < Math.max(24, diag * 0.22);
+  // Slightly looser "closed" so nearly-closed rectangles still qualify.
+  const closed = gap < Math.max(28, diag * 0.25);
+
+  // Count sharp direction changes to filter out scribbles.
   let turns = 0;
   let prev: number | null = null;
   const step = Math.max(1, Math.floor(points.length / 28));
@@ -314,18 +383,17 @@ export function snapShape(
     if (prev !== null) {
       let d = Math.abs(ang - prev);
       if (d > Math.PI) d = Math.PI * 2 - d;
-      if (d > 0.9) turns += 1;
+      if (d > 1.0) turns += 1;
     }
     prev = ang;
   }
-  if (turns >= 9) return null;
+  if (turns >= 10) return null;
 
-  // --- LINE / ARROW ---
+  // 1) LINE / ARROW ----------------------------------------------------------
   if (!closed && turns <= 3) {
     let dev = 0;
     for (const p of points) dev = Math.max(dev, distToSeg(p.x, p.y, start.x, start.y, end.x, end.y));
-    const straight = dev / diag;
-    if (straight < 0.07) {
+    if (dev / diag < 0.07) {
       const cut = Math.max(1, Math.floor(points.length * 0.84));
       let head = 0;
       for (let i = cut; i < points.length; i++) {
@@ -335,7 +403,7 @@ export function snapShape(
         );
       }
       const main = Math.hypot(points[cut].x - start.x, points[cut].y - start.y) || 1;
-      if (head > Math.max(14, main * 0.14)) {
+      if (head > Math.max(14, main * 0.16)) {
         return { type: "arrow", x1: start.x, y1: start.y, x2: points[cut].x, y2: points[cut].y, ...style };
       }
       return { type: "line", x1: start.x, y1: start.y, x2: end.x, y2: end.y, ...style };
@@ -344,62 +412,14 @@ export function snapShape(
 
   if (!closed) return null;
 
-  const cx = (x0 + x1) / 2;
-  const cy = (y0 + y1) / 2;
-  const rx = bw / 2 || 1;
-  const ry = bh / 2 || 1;
-
-  // --- CIRCLE ---
-  let err = 0;
-  for (const p of points) {
-    err += Math.abs(Math.hypot((p.x - cx) / rx, (p.y - cy) / ry) - 1);
-  }
-  err /= points.length;
-  const aspect = Math.min(bw, bh) / Math.max(bw, bh);
-  if (err < 0.22 && turns <= 4 && aspect > 0.4) {
-    return { type: "circle", x: x0, y: y0, w: bw, h: bh, ...style };
+  // 2) RECTANGLE (BEFORE circle!) -------------------------------------------
+  if (isRectangle(points, b)) {
+    return { type: "rect", x: b.x0, y: b.y0, w: bw, h: bh, ...style };
   }
 
-  // --- RECTANGLE (improved) ---
-  // Count points that sit near each of the four bounding-box edges.
-  const tol = Math.max(10, diag * 0.09);
-  let onTop = 0;
-  let onBottom = 0;
-  let onLeft = 0;
-  let onRight = 0;
-  for (const p of points) {
-    // Point counts toward an edge only if it is close to that edge and inside the box.
-    const nearTop = Math.abs(p.y - y0) < tol;
-    const nearBottom = Math.abs(p.y - y1) < tol;
-    const nearLeft = Math.abs(p.x - x0) < tol;
-    const nearRight = Math.abs(p.x - x1) < tol;
-    if (nearTop) onTop += 1;
-    else if (nearBottom) onBottom += 1;
-    if (nearLeft) onLeft += 1;
-    else if (nearRight) onRight += 1;
-  }
-  const edgeTop = onTop / points.length;
-  const edgeBottom = onBottom / points.length;
-  const edgeLeft = onLeft / points.length;
-  const edgeRight = onRight / points.length;
-  const minEdge = 0.14; // at least 14% of points must lie on each edge
-  const edgesPresent =
-    edgeTop > minEdge && edgeBottom > minEdge && edgeLeft > minEdge && edgeRight > minEdge;
-
-  // Count interior points (points that are not near any edge)
-  let interior = 0;
-  for (const p of points) {
-    const nearEdge =
-      Math.abs(p.x - x0) < tol ||
-      Math.abs(p.x - x1) < tol ||
-      Math.abs(p.y - y0) < tol ||
-      Math.abs(p.y - y1) < tol;
-    if (!nearEdge) interior += 1;
-  }
-  const interiorRatio = interior / points.length;
-
-  if (edgesPresent && interiorRatio < 0.35 && turns >= 2 && turns <= 8) {
-    return { type: "rect", x: x0, y: y0, w: bw, h: bh, ...style };
+  // 3) CIRCLE / ELLIPSE ------------------------------------------------------
+  if (isCircle(points, b)) {
+    return { type: "circle", x: b.x0, y: b.y0, w: bw, h: bh, ...style };
   }
 
   return null;
