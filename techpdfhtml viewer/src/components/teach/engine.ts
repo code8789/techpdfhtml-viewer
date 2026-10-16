@@ -1186,18 +1186,13 @@ export class Engine {
     this.els.stage.style.gap = `${pad}px`;
   }
 
-  private applyTransform() {
-    const R = this.visualRatio;
-    this.applyChromeSpace();
-    const idle = Math.abs(R - 1) < 0.001;
-    if (idle) {
-      this.els.stage.style.transform = "";
-      this.els.stage.classList.remove("is-pinching");
-      this.els.sizer.style.width = "";
-      this.els.sizer.style.height = "";
-      this.els.sizer.style.minWidth = "";
-      return;
-    }
+ private applyTransform() {
+  const R = this.visualRatio;
+  this.applyChromeSpace();
+  const idle = Math.abs(R - 1) < 0.001;
+  this.els.stage.style.transform = idle ? "" : `scale(${R})`;
+  this.els.stage.style.transformOrigin = "0 0";
+}
     this.els.stage.style.transform = `scale(${R})`;
     this.els.stage.style.transformOrigin = "0 0";
     this.els.stage.classList.add("is-pinching");
