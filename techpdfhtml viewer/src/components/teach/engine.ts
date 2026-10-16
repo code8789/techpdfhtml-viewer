@@ -1356,7 +1356,7 @@ export class Engine {
         tile.canvas = canvas;
         tile.ctx = canvas.getContext("2d");
       }
-      const changed = this.resizeInk(page, tile);
+      const changed = false; // temporarily disabled
       if (changed || force) this.paintTile(page, tile);
     }
   }
