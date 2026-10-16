@@ -161,6 +161,7 @@
   overscroll-behavior: none;
   touch-action: none;
   scrollbar-gutter: stable;
+  background: #ffffff;
 }
 
 .teach-sizer {
@@ -180,6 +181,11 @@
   flex-direction: column;
   align-items: center;
   transform-origin: 0 0;
+  background: #ffffff;
+  will-change: transform;
+  backface-visibility: hidden;
+  -webkit-backface-visibility: hidden;
+  transform: translateZ(0);
 }
 
 .page-shell {
@@ -256,11 +262,14 @@
   display: block;
 }
 
+/* ---------- Media: rotation, handles, selection ---------- */
 .media-item {
   position: absolute;
   pointer-events: auto;
   touch-action: none;
   max-width: none;
+  transform-origin: center center;
+  transform: rotate(var(--rot, 0deg));
 }
 
 .media-item.is-on {
@@ -276,18 +285,53 @@
   object-fit: contain;
 }
 
+/* Handles are hidden by default and shown for the selected item. */
+.media-item .media-handle,
+.media-item .media-rotate {
+  display: none;
+}
+.media-item.is-on .media-handle,
+.media-item.is-on .media-rotate {
+  display: block;
+}
+
 .media-handle {
   position: absolute;
-  right: calc(-4px / var(--page-scale, 1));
-  bottom: calc(-4px / var(--page-scale, 1));
-  width: calc(22px / var(--page-scale, 1));
-  height: calc(22px / var(--page-scale, 1));
+  right: calc(-8px / var(--page-scale, 1));
+  bottom: calc(-8px / var(--page-scale, 1));
+  width: calc(24px / var(--page-scale, 1));
+  height: calc(24px / var(--page-scale, 1));
   border-radius: 999px;
   background: var(--color-primary);
   border: calc(2px / var(--page-scale, 1)) solid white;
   box-sizing: border-box;
 }
 
+.media-rotate {
+  position: absolute;
+  left: 50%;
+  top: calc(-32px / var(--page-scale, 1));
+  transform: translateX(-50%);
+  width: calc(24px / var(--page-scale, 1));
+  height: calc(24px / var(--page-scale, 1));
+  border-radius: 999px;
+  background: var(--color-primary);
+  border: calc(2px / var(--page-scale, 1)) solid white;
+  box-sizing: border-box;
+}
+.media-rotate::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 100%;
+  width: calc(2px / var(--page-scale, 1));
+  height: calc(10px / var(--page-scale, 1));
+  transform: translateX(-50%);
+  background: var(--color-primary);
+  border-radius: 999px;
+}
+
+/* Laser size is set inline from engine.ts. Keep the CSS free of fixed size. */
 .laser-dot {
   position: fixed;
   width: 18px;
@@ -654,14 +698,29 @@
   accent-color: var(--color-primary);
 }
 
-/* ---------- Focus mode: hide top bar + dock ---------- */
+/* ---------- Focus mode: hide TOP BAR only, KEEP THE DOCK ---------- */
 .teach-app.is-focus .teach-top,
-.teach-app.is-focus .teach-dock,
 .teach-app.is-focus .teach-sheet,
 .teach-app.is-focus .teach-drawer,
-.teach-app.is-focus .teach-pop,
-.teach-app.is-focus .teach-chip {
+.teach-app.is-focus .teach-pop {
   display: none;
+}
+
+/* The dock stays visible in focus mode, just slightly tighter. */
+.teach-app.is-focus .teach-dock {
+  display: flex;
+  bottom: max(0.35rem, env(safe-area-inset-bottom));
+  padding: 0.25rem;
+  border-radius: 0.75rem;
+}
+
+.teach-app.is-focus .teach-dock-scroll {
+  gap: 0.15rem;
+}
+
+.teach-app.is-focus .teach-tool {
+  width: 2.25rem;
+  height: 2.25rem;
 }
 
 .teach-app.is-focus .teach-scroll {
@@ -669,7 +728,12 @@
 }
 
 .teach-app.is-focus .dock-spacer {
-  height: 1rem;
+  height: 3.25rem;
+}
+
+/* ---------- Pinch: disable inner iframe hit-testing ------------- */
+.teach-app.is-pinching .html-frame {
+  pointer-events: none;
 }
 
 /* ---------- Mobile sizing ---------- */
