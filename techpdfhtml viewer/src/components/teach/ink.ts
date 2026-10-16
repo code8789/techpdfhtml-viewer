@@ -21,7 +21,7 @@ export type LineObj = {
 };
 
 export type ShapeObj = {
-  type: "rect" | "circle";
+  type: "rect" | "circle" | "triangle";
   x: number;
   y: number;
   w: number;
@@ -57,7 +57,7 @@ export type MediaObj = {
   y: number;
   w: number;
   h: number;
-  rotation?: number; // degrees, clockwise, about the media's center
+  rotation?: number;
 };
 
 export const COLORS = [
@@ -193,6 +193,19 @@ function strokePoints(ctx: CanvasRenderingContext2D, points: Pt[]) {
   ctx.stroke();
 }
 
+function triangleVertices(x: number, y: number, w: number, h: number): [Pt, Pt, Pt] {
+  // Apex at top-center, base along the bottom of the bounding box.
+  const x0 = Math.min(x, x + w);
+  const y0 = Math.min(y, y + h);
+  const x1 = Math.max(x, x + w);
+  const y1 = Math.max(y, y + h);
+  return [
+    { x: (x0 + x1) / 2, y: y0 },
+    { x: x1, y: y1 },
+    { x: x0, y: y1 },
+  ];
+}
+
 export function drawObj(ctx: CanvasRenderingContext2D, o: DrawObj) {
   if (o.type === "erase") {
     ctx.save();
@@ -209,7 +222,7 @@ export function drawObj(ctx: CanvasRenderingContext2D, o: DrawObj) {
   ctx.save();
   ctx.lineCap = "round";
   ctx.lineJoin = "round";
-  ctx.globalAlpha = Math.max(0.05, Math.min(1, o.type === "stroke" ? o.opacity : o.opacity));
+  ctx.globalAlpha = Math.max(0.05, Math.min(1, o.opacity));
   ctx.strokeStyle = o.color;
   ctx.fillStyle = o.color;
   ctx.lineWidth = o.type === "text" ? 1 : o.width;
@@ -236,6 +249,14 @@ export function drawObj(ctx: CanvasRenderingContext2D, o: DrawObj) {
   } else if (o.type === "circle") {
     ctx.beginPath();
     ctx.ellipse(o.x + o.w / 2, o.y + o.h / 2, Math.abs(o.w / 2), Math.abs(o.h / 2), 0, 0, Math.PI * 2);
+    ctx.stroke();
+  } else if (o.type === "triangle") {
+    const [a, b, c] = triangleVertices(o.x, o.y, o.w, o.h);
+    ctx.beginPath();
+    ctx.moveTo(a.x, a.y);
+    ctx.lineTo(b.x, b.y);
+    ctx.lineTo(c.x, c.y);
+    ctx.closePath();
     ctx.stroke();
   } else if (o.type === "text") {
     ctx.globalAlpha = o.opacity;
@@ -276,20 +297,30 @@ export function objSvg(o: DrawObj) {
   if (o.type === "circle") {
     return `<ellipse cx="${r2(o.x + o.w / 2)}" cy="${r2(o.y + o.h / 2)}" rx="${r2(Math.abs(o.w / 2))}" ry="${r2(Math.abs(o.h / 2))}" fill="none" stroke="${o.color}" stroke-width="${r2(o.width)}" opacity="${op}"/>`;
   }
+  if (o.type === "triangle") {
+    const [a, b, c] = triangleVertices(o.x, o.y, o.w, o.h);
+    return `<polygon points="${r2(a.x)},${r2(a.y)} ${r2(b.x)},${r2(b.y)} ${r2(c.x)},${r2(c.y)}" fill="none" stroke="${o.color}" stroke-width="${r2(o.width)}" opacity="${op}"/>`;
+  }
   return `<text x="${r2(o.x)}" y="${r2(o.y)}" fill="${o.color}" font-size="${r2(o.fontSize)}" font-family="Source Sans 3, sans-serif" opacity="${op}">${xmlText(o.text)}</text>`;
 }
 
-/* -------------------------------------------------------------------------- */
-/*  SHAPE DETECTION                                                           */
-/*                                                                            */
-/*  Order matters: line/arrow -> RECTANGLE -> circle/ellipse.                 */
-/*  Testing rectangle before circle is what makes hand-drawn rectangles       */
-/*  reliably classified as rect instead of circle.                            */
-/* -------------------------------------------------------------------------- */
+/* --------------------------------------------------------------------------
+   SHAPE DETECTION — rewritten from scratch.
 
-type Bounds = { x0: number; y0: number; x1: number; y1: number };
+   Detection order:
+     1. Line / Arrow  (open, straight)
+     2. Triangle      (closed, 3 corners)
+     3. Rectangle     (closed, 4 corners, points hug bbox perimeter)
+     4. Circle        (closed, points on an ellipse, high aspect ratio)
 
-function boundingBox(points: Pt[]): Bounds {
+   Correct order matters: a hand-drawn rectangle can look like a
+   squashed circle, and a hand-drawn triangle can look like both. We
+   test corners first because they are the most distinguishing feature.
+   -------------------------------------------------------------------------- */
+
+type B = { x0: number; y0: number; x1: number; y1: number };
+
+function bbox(points: Pt[]): B {
   let x0 = Infinity;
   let y0 = Infinity;
   let x1 = -Infinity;
@@ -303,66 +334,70 @@ function boundingBox(points: Pt[]): Bounds {
   return { x0, y0, x1, y1 };
 }
 
-/**
- * Detects a rectangle: every point must be near one of the 4 bounding-box
- * edges (within `tol`), and no point may sit deep in the interior.
- * Hand-drawn circles fail this because their left and right extremes are
- * smooth arcs, so many points fall well inside the bbox horizontally.
- */
-function isRectangle(points: Pt[], b: Bounds): boolean {
-  const bw = b.x1 - b.x0;
-  const bh = b.y1 - b.y0;
-  const diag = Math.hypot(bw, bh);
-  if (diag < 30) return false;
-  // Keep the tolerance tight: a wobbly hand-drawn line should still count.
-  const tol = Math.max(6, diag * 0.08);
-  let onPerimeter = 0;
-  for (const p of points) {
-    const nearV = Math.abs(p.x - b.x0) < tol || Math.abs(p.x - b.x1) < tol;
-    const nearH = Math.abs(p.y - b.y0) < tol || Math.abs(p.y - b.y1) < tol;
-    if (nearV || nearH) onPerimeter++;
-    else return false; // any point truly inside disqualifies -> rectangle
+/** Returns the indices of points where the direction changes sharply. */
+function cornerIndices(points: Pt[], threshold: number): number[] {
+  const idx: number[] = [];
+  if (points.length < 5) return idx;
+  const step = Math.max(2, Math.floor(points.length / 40));
+  let prevAng: number | null = null;
+  for (let i = step; i < points.length - step; i += step) {
+    const a = Math.atan2(
+      points[i].y - points[i - step].y,
+      points[i].x - points[i - step].x,
+    );
+    if (prevAng !== null) {
+      let d = Math.abs(a - prevAng);
+      if (d > Math.PI) d = Math.PI * 2 - d;
+      if (d > threshold) idx.push(i);
+    }
+    prevAng = a;
   }
-  // Require almost all points to hug the perimeter.
-  return onPerimeter / points.length > 0.9;
+  // Merge corner indices that are close together (same corner counted twice).
+  const merged: number[] = [];
+  for (const i of idx) {
+    if (!merged.length || i - merged[merged.length - 1] > step * 2) merged.push(i);
+  }
+  return merged;
 }
 
 /**
- * Detects a circle/ellipse. We deliberately require a high aspect ratio
- * (so squat rectangles cannot pass) and a tight normalized radius error.
+ * Tests a stroke against a shape defined by corner points.
+ * Returns the mean distance from each stroke point to the nearest edge,
+ * normalized by the shape's diagonal (so 0 = perfect fit).
  */
-function isCircle(points: Pt[], b: Bounds): boolean {
-  const bw = b.x1 - b.x0;
-  const bh = b.y1 - b.y0;
-  if (bw < 20 || bh < 20) return false;
-  const aspect = Math.min(bw, bh) / Math.max(bw, bh);
-  if (aspect < 0.6) return false; // too rectangular to be a circle
-  const cx = (b.x0 + b.x1) / 2;
-  const cy = (b.y0 + b.y1) / 2;
-  const rx = bw / 2 || 1;
-  const ry = bh / 2 || 1;
-  let err = 0;
+function fitToPolygon(points: Pt[], corners: Pt[]): number {
+  const n = corners.length;
+  let total = 0;
   for (const p of points) {
-    err += Math.abs(Math.hypot((p.x - cx) / rx, (p.y - cy) / ry) - 1);
+    let best = Infinity;
+    for (let i = 0; i < n; i++) {
+      const a = corners[i];
+      const b = corners[(i + 1) % n];
+      best = Math.min(best, distToSeg(p.x, p.y, a.x, a.y, b.x, b.y));
+    }
+    total += best;
   }
-  err /= points.length;
-  // 0.13 is strict enough that a rectangle is rejected, loose enough for
-  // a hand-drawn circle. Bump to 0.16 if circles are missed.
-  return err < 0.13;
+  const diag = Math.hypot(
+    Math.max(...corners.map((c) => c.x)) - Math.min(...corners.map((c) => c.x)),
+    Math.max(...corners.map((c) => c.y)) - Math.min(...corners.map((c) => c.y)),
+  ) || 1;
+  return total / points.length / diag;
 }
 
 export function snapShape(
   points: Pt[],
   style: { color: string; width: number; opacity: number },
 ): DrawObj | null {
-  if (points.length < 12) return null;
+  if (points.length < 8) return null;
+
+  // Total arc length — a stray dot should not become a shape.
   let length = 0;
   for (let i = 1; i < points.length; i++) {
     length += Math.hypot(points[i].x - points[i - 1].x, points[i].y - points[i - 1].y);
   }
   if (length < 40) return null;
 
-  const b = boundingBox(points);
+  const b = bbox(points);
   const bw = b.x1 - b.x0;
   const bh = b.y1 - b.y0;
   const diag = Math.hypot(bw, bh) || 1;
@@ -371,30 +406,19 @@ export function snapShape(
   const start = points[0];
   const end = points[points.length - 1];
   const gap = Math.hypot(end.x - start.x, end.y - start.y);
-  // Slightly looser "closed" so nearly-closed rectangles still qualify.
-  const closed = gap < Math.max(28, diag * 0.25);
+  // Closed if endpoints meet within 28% of the shape's diagonal.
+  const closed = gap < Math.max(26, diag * 0.28);
 
-  // Count sharp direction changes to filter out scribbles.
-  let turns = 0;
-  let prev: number | null = null;
-  const step = Math.max(1, Math.floor(points.length / 28));
-  for (let i = step; i < points.length; i += step) {
-    const ang = Math.atan2(points[i].y - points[i - step].y, points[i].x - points[i - step].x);
-    if (prev !== null) {
-      let d = Math.abs(ang - prev);
-      if (d > Math.PI) d = Math.PI * 2 - d;
-      if (d > 1.0) turns += 1;
-    }
-    prev = ang;
-  }
-  if (turns >= 10) return null;
+  const corners = cornerIndices(points, 1.0);
 
-  // 1) LINE / ARROW ----------------------------------------------------------
-  if (!closed && turns <= 3) {
+  // ---------- 1. LINE / ARROW --------------------------------------------
+  if (!closed && corners.length <= 2) {
+    // Straightness check: every point near the start-end line.
     let dev = 0;
     for (const p of points) dev = Math.max(dev, distToSeg(p.x, p.y, start.x, start.y, end.x, end.y));
-    if (dev / diag < 0.07) {
-      const cut = Math.max(1, Math.floor(points.length * 0.84));
+    if (dev / diag < 0.09) {
+      // Arrow if the tail has a V-splay.
+      const cut = Math.max(1, Math.floor(points.length * 0.85));
       let head = 0;
       for (let i = cut; i < points.length; i++) {
         head = Math.max(
@@ -404,7 +428,14 @@ export function snapShape(
       }
       const main = Math.hypot(points[cut].x - start.x, points[cut].y - start.y) || 1;
       if (head > Math.max(14, main * 0.16)) {
-        return { type: "arrow", x1: start.x, y1: start.y, x2: points[cut].x, y2: points[cut].y, ...style };
+        return {
+          type: "arrow",
+          x1: start.x,
+          y1: start.y,
+          x2: points[cut].x,
+          y2: points[cut].y,
+          ...style,
+        };
       }
       return { type: "line", x1: start.x, y1: start.y, x2: end.x, y2: end.y, ...style };
     }
@@ -412,14 +443,51 @@ export function snapShape(
 
   if (!closed) return null;
 
-  // 2) RECTANGLE (BEFORE circle!) -------------------------------------------
-  if (isRectangle(points, b)) {
-    return { type: "rect", x: b.x0, y: b.y0, w: bw, h: bh, ...style };
+  // ---------- 2. TRIANGLE (3 corners) ------------------------------------
+  if (corners.length >= 2 && corners.length <= 4) {
+    // Pick the 3 most prominent corners.
+    const c3 = corners.slice(0, 3).map((i) => points[i]);
+    if (c3.length === 3) {
+      const err = fitToPolygon(points, c3);
+      if (err < 0.11) {
+        // Recompute a clean triangle in bbox space so it renders nicely.
+        return { type: "triangle", x: b.x0, y: b.y0, w: bw, h: bh, ...style };
+      }
+    }
   }
 
-  // 3) CIRCLE / ELLIPSE ------------------------------------------------------
-  if (isCircle(points, b)) {
-    return { type: "circle", x: b.x0, y: b.y0, w: bw, h: bh, ...style };
+  // ---------- 3. RECTANGLE (4 corners, perimeter-hugging) ----------------
+  if (corners.length >= 3 && corners.length <= 6) {
+    // Corners of the bounding box.
+    const rectCorners: Pt[] = [
+      { x: b.x0, y: b.y0 },
+      { x: b.x1, y: b.y0 },
+      { x: b.x1, y: b.y1 },
+      { x: b.x0, y: b.y1 },
+    ];
+    const err = fitToPolygon(points, rectCorners);
+    if (err < 0.11) {
+      return { type: "rect", x: b.x0, y: b.y0, w: bw, h: bh, ...style };
+    }
+  }
+
+  // ---------- 4. CIRCLE / ELLIPSE ----------------------------------------
+  {
+    const aspect = Math.min(bw, bh) / Math.max(bw, bh);
+    if (aspect > 0.5) {
+      const cx = (b.x0 + b.x1) / 2;
+      const cy = (b.y0 + b.y1) / 2;
+      const rx = bw / 2 || 1;
+      const ry = bh / 2 || 1;
+      let err = 0;
+      for (const p of points) {
+        err += Math.abs(Math.hypot((p.x - cx) / rx, (p.y - cy) / ry) - 1);
+      }
+      err /= points.length;
+      if (err < 0.16) {
+        return { type: "circle", x: b.x0, y: b.y0, w: bw, h: bh, ...style };
+      }
+    }
   }
 
   return null;
