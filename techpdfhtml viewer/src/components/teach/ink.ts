@@ -305,17 +305,25 @@ export function objSvg(o: DrawObj) {
 }
 
 /* --------------------------------------------------------------------------
-   SHAPE DETECTION — rewritten from scratch.
+   SHAPE DETECTION
 
    Detection order:
      1. Line / Arrow  (open, straight)
      2. Triangle      (closed, 3 corners)
-     3. Rectangle     (closed, 4 corners, points hug bbox perimeter)
+     3. Rectangle     (closed, points hug bbox perimeter)
      4. Circle        (closed, points on an ellipse, high aspect ratio)
 
-   Correct order matters: a hand-drawn rectangle can look like a
-   squashed circle, and a hand-drawn triangle can look like both. We
-   test corners first because they are the most distinguishing feature.
+   Order matters. A hand-drawn rectangle is closer to a squashed
+   circle than to a triangle, so circle must be tested LAST. A
+   hand-drawn triangle has 3 corners, a rectangle has 4 -- that is
+   the primary distinguishing feature, so we test corner count first.
+
+   Threshold notes:
+     - Triangle:  0.14 (looser, since fat hand-drawn triangles are common)
+     - Rectangle: 0.16 (looser than triangle, because corner overshoot
+                       is normal when drawing a rect by hand)
+     - Circle:    0.16 with aspect ratio guard, so rectangles don't
+                       fall through to circle after failing rect.
    -------------------------------------------------------------------------- */
 
 type B = { x0: number; y0: number; x1: number; y1: number };
@@ -334,7 +342,6 @@ function bbox(points: Pt[]): B {
   return { x0, y0, x1, y1 };
 }
 
-/** Returns the indices of points where the direction changes sharply. */
 function cornerIndices(points: Pt[], threshold: number): number[] {
   const idx: number[] = [];
   if (points.length < 5) return idx;
@@ -352,7 +359,6 @@ function cornerIndices(points: Pt[], threshold: number): number[] {
     }
     prevAng = a;
   }
-  // Merge corner indices that are close together (same corner counted twice).
   const merged: number[] = [];
   for (const i of idx) {
     if (!merged.length || i - merged[merged.length - 1] > step * 2) merged.push(i);
@@ -360,11 +366,6 @@ function cornerIndices(points: Pt[], threshold: number): number[] {
   return merged;
 }
 
-/**
- * Tests a stroke against a shape defined by corner points.
- * Returns the mean distance from each stroke point to the nearest edge,
- * normalized by the shape's diagonal (so 0 = perfect fit).
- */
 function fitToPolygon(points: Pt[], corners: Pt[]): number {
   const n = corners.length;
   let total = 0;
@@ -390,7 +391,6 @@ export function snapShape(
 ): DrawObj | null {
   if (points.length < 8) return null;
 
-  // Total arc length — a stray dot should not become a shape.
   let length = 0;
   for (let i = 1; i < points.length; i++) {
     length += Math.hypot(points[i].x - points[i - 1].x, points[i].y - points[i - 1].y);
@@ -406,18 +406,15 @@ export function snapShape(
   const start = points[0];
   const end = points[points.length - 1];
   const gap = Math.hypot(end.x - start.x, end.y - start.y);
-  // Closed if endpoints meet within 28% of the shape's diagonal.
   const closed = gap < Math.max(26, diag * 0.28);
 
   const corners = cornerIndices(points, 1.0);
 
   // ---------- 1. LINE / ARROW --------------------------------------------
   if (!closed && corners.length <= 2) {
-    // Straightness check: every point near the start-end line.
     let dev = 0;
     for (const p of points) dev = Math.max(dev, distToSeg(p.x, p.y, start.x, start.y, end.x, end.y));
     if (dev / diag < 0.09) {
-      // Arrow if the tail has a V-splay.
       const cut = Math.max(1, Math.floor(points.length * 0.85));
       let head = 0;
       for (let i = cut; i < points.length; i++) {
@@ -443,22 +440,21 @@ export function snapShape(
 
   if (!closed) return null;
 
-  // ---------- 2. TRIANGLE (3 corners) ------------------------------------
+  // ---------- 2. TRIANGLE -------------------------------------------------
   if (corners.length >= 2 && corners.length <= 4) {
-    // Pick the 3 most prominent corners.
     const c3 = corners.slice(0, 3).map((i) => points[i]);
     if (c3.length === 3) {
       const err = fitToPolygon(points, c3);
-      if (err < 0.11) {
-        // Recompute a clean triangle in bbox space so it renders nicely.
+      if (err < 0.14) {
         return { type: "triangle", x: b.x0, y: b.y0, w: bw, h: bh, ...style };
       }
     }
   }
 
-  // ---------- 3. RECTANGLE (4 corners, perimeter-hugging) ----------------
-  if (corners.length >= 3 && corners.length <= 6) {
-    // Corners of the bounding box.
+  // ---------- 3. RECTANGLE -----------------------------------------------
+  // Test rectangle before circle so hand-drawn rects don't get
+  // misclassified as squashed circles.
+  {
     const rectCorners: Pt[] = [
       { x: b.x0, y: b.y0 },
       { x: b.x1, y: b.y0 },
@@ -466,7 +462,7 @@ export function snapShape(
       { x: b.x0, y: b.y1 },
     ];
     const err = fitToPolygon(points, rectCorners);
-    if (err < 0.11) {
+    if (err < 0.16) {
       return { type: "rect", x: b.x0, y: b.y0, w: bw, h: bh, ...style };
     }
   }
