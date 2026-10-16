@@ -20,12 +20,20 @@ import {
   Redo2,
   Slash,
   Square,
+  Trash2,
   Type,
   Undo2,
   X,
 } from "lucide-react";
 import { COLORS, colorName } from "@/components/teach/ink";
-import { Engine, type Prefs, type StageEls, type TeachHooks, type TeachPatch, type Tool } from "@/components/teach/engine";
+import {
+  Engine,
+  type Prefs,
+  type StageEls,
+  type TeachHooks,
+  type TeachPatch,
+  type Tool,
+} from "@/components/teach/engine";
 import { sampleHtml } from "@/components/teach/sample";
 
 type Ask =
@@ -88,6 +96,7 @@ export function TeachApp() {
   const [color, setColor] = useState<string>(COLORS[0]);
   const [size, setSize] = useState(5);
   const [eraserSize, setEraserSize] = useState(18);
+  const [laserSize, setLaserSize] = useState(18);
   const [opacity, setOpacity] = useState(100);
   const [invert, setInvert] = useState(false);
   const [shapeDetect, setShapeDetect] = useState(false);
@@ -108,6 +117,7 @@ export function TeachApp() {
     progress: null as { label: string; ratio: number } | null,
     video: false,
     ready: false,
+    selectedMedia: false,
   });
 
   const prefsRef = useRef<Prefs>({
@@ -118,6 +128,7 @@ export function TeachApp() {
     opacity: 1,
     invert: false,
     shapeDetect: false,
+    laserSize: 18,
   });
   prefsRef.current = {
     tool,
@@ -127,6 +138,7 @@ export function TeachApp() {
     opacity: opacity / 100,
     invert,
     shapeDetect,
+    laserSize,
   };
 
   const hooksRef = useRef<TeachHooks>(null!);
@@ -144,6 +156,7 @@ export function TeachApp() {
         progress: p.progress === undefined ? prev.progress : p.progress,
         video: p.video ?? prev.video,
         ready: p.ready ?? prev.ready,
+        selectedMedia: p.selectedMedia ?? prev.selectedMedia,
       }));
     },
     onZoom: (z: number) => {
@@ -187,7 +200,7 @@ export function TeachApp() {
 
   useEffect(() => {
     engineRef.current?.notePrefs();
-  }, [tool, invert]);
+  }, [tool, invert, shapeDetect]);
 
   useEffect(() => {
     if (thumbsOpen && thumbRef.current) void engineRef.current?.fillThumbs(thumbRef.current);
@@ -210,25 +223,6 @@ export function TeachApp() {
   function chooseFiles(list: FileList | null) {
     const files = list ? [...list] : [];
     if (files.length) void engineRef.current?.openFiles(files);
-  }
-
-  function toggleFocus() {
-    setPadsHidden((hidden) => !hidden);
-    if (typeof document === "undefined") return;
-    const doc = document as Document & {
-      webkitFullscreenElement?: Element | null;
-      webkitExitFullscreen?: () => Promise<void>;
-    };
-    const el = document.documentElement as HTMLElement & {
-      webkitRequestFullscreen?: () => Promise<void>;
-    };
-    if (!document.fullscreenElement && !doc.webkitFullscreenElement) {
-      if (el.requestFullscreen) void el.requestFullscreen().catch(() => {});
-      else if (el.webkitRequestFullscreen) void el.webkitRequestFullscreen().catch(() => {});
-    } else {
-      if (document.exitFullscreen) void document.exitFullscreen().catch(() => {});
-      else if (doc.webkitExitFullscreen) void doc.webkitExitFullscreen().catch(() => {});
-    }
   }
 
   return (
@@ -364,6 +358,23 @@ export function TeachApp() {
           <div className="teach-chip">
             Video controls
             <button type="button" className="teach-btn" onClick={() => engineRef.current?.clearVideoFocus()}>
+              Done
+            </button>
+          </div>
+        )}
+
+        {ui.selectedMedia && (
+          <div className="teach-chip" style={{ bottom: "calc(4.6rem + env(safe-area-inset-bottom))" }}>
+            <button
+              type="button"
+              className="teach-btn"
+              aria-label="Delete selected media"
+              onClick={() => engineRef.current?.deleteSelectedMedia()}
+            >
+              <Trash2 size={16} />
+              <span className="label">Delete</span>
+            </button>
+            <button type="button" className="teach-btn" onClick={() => engineRef.current?.clearSelection()}>
               Done
             </button>
           </div>
@@ -578,9 +589,9 @@ export function TeachApp() {
             <button
               type="button"
               className={`teach-tool${padsHidden ? " is-on" : ""}`}
-              aria-label={padsHidden ? "Show header and tool pads" : "Hide header and tool pads"}
+              aria-label={padsHidden ? "Show top bar" : "Hide top bar"}
               aria-pressed={padsHidden}
-              onClick={toggleFocus}
+              onClick={() => setPadsHidden((hidden) => !hidden)}
             >
               {padsHidden ? <Maximize2 size={18} /> : <Minimize2 size={18} />}
             </button>
@@ -610,6 +621,17 @@ export function TeachApp() {
                 max={100}
                 value={opacity}
                 onChange={(event) => setOpacity(Number(event.target.value))}
+              />
+            </div>
+            <div className="setting-row">
+              <label htmlFor="laser-size">Laser size</label>
+              <input
+                id="laser-size"
+                type="range"
+                min={6}
+                max={64}
+                value={laserSize}
+                onChange={(event) => setLaserSize(Number(event.target.value))}
               />
             </div>
             <div className="setting-row">
