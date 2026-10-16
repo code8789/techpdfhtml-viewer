@@ -83,6 +83,32 @@ const Stage = memo(function Stage({
   );
 });
 
+/**
+ * Toggle browser-native fullscreen.
+ * On Android Chrome this hides the phone's own status bar.
+ * On iPhone Safari this is a no-op (iOS does not support it on
+ * non-video elements) — the CSS-based focus mode still hides the
+ * app's top bar in that case.
+ */
+function toggleNativeFullscreen() {
+  if (typeof document === "undefined") return;
+  const doc = document as Document & {
+    webkitFullscreenElement?: Element | null;
+    webkitExitFullscreen?: () => Promise<void>;
+  };
+  const el = document.documentElement as HTMLElement & {
+    webkitRequestFullscreen?: () => Promise<void>;
+  };
+  const isFs = !!document.fullscreenElement || !!doc.webkitFullscreenElement;
+  if (!isFs) {
+    if (el.requestFullscreen) void el.requestFullscreen().catch(() => {});
+    else if (el.webkitRequestFullscreen) void el.webkitRequestFullscreen().catch(() => {});
+  } else {
+    if (document.exitFullscreen) void document.exitFullscreen().catch(() => {});
+    else if (doc.webkitExitFullscreen) void doc.webkitExitFullscreen().catch(() => {});
+  }
+}
+
 export function TeachApp() {
   const engineRef = useRef<Engine | null>(null);
   const zoomRef = useRef<HTMLSpanElement>(null);
@@ -223,6 +249,27 @@ export function TeachApp() {
   function chooseFiles(list: FileList | null) {
     const files = list ? [...list] : [];
     if (files.length) void engineRef.current?.openFiles(files);
+  }
+
+  function enterFocusMode() {
+    // 1) hide the app's own top bar (works everywhere, including iPhone)
+    setPadsHidden(true);
+    // 2) ask the browser for true fullscreen (hides Android status bar too)
+    toggleNativeFullscreen();
+  }
+
+  function exitFocusMode() {
+    setPadsHidden(false);
+    // If the browser is still in native fullscreen, leave it.
+    if (typeof document === "undefined") return;
+    const doc = document as Document & {
+      webkitFullscreenElement?: Element | null;
+      webkitExitFullscreen?: () => Promise<void>;
+    };
+    const isFs = !!document.fullscreenElement || !!doc.webkitFullscreenElement;
+    if (!isFs) return;
+    if (document.exitFullscreen) void document.exitFullscreen().catch(() => {});
+    else if (doc.webkitExitFullscreen) void doc.webkitExitFullscreen().catch(() => {});
   }
 
   return (
@@ -587,35 +634,17 @@ export function TeachApp() {
               <PagesIcon />
             </button>
             <button
-  type="button"
-  className={`teach-tool${padsHidden ? " is-on" : ""}`}
-  aria-label={padsHidden ? "Exit fullscreen" : "Enter fullscreen"}
-  aria-pressed={padsHidden}
-  onClick={() => {
-    // toggle top bar
-    setPadsHidden((hidden) => !hidden);
-
-    // toggle native fullscreen (hides the phone's own status bar too)
-    if (typeof document === "undefined") return;
-    const doc = document as Document & {
-      webkitFullscreenElement?: Element | null;
-      webkitExitFullscreen?: () => Promise<void>;
-    };
-    const el = document.documentElement as HTMLElement & {
-      webkitRequestFullscreen?: () => Promise<void>;
-    };
-    const isFs = !!document.fullscreenElement || !!doc.webkitFullscreenElement;
-    if (!isFs) {
-      if (el.requestFullscreen) void el.requestFullscreen().catch(() => {});
-      else if (el.webkitRequestFullscreen) void el.webkitRequestFullscreen().catch(() => {});
-    } else {
-      if (document.exitFullscreen) void document.exitFullscreen().catch(() => {});
-      else if (doc.webkitExitFullscreen) void doc.webkitExitFullscreen().catch(() => {});
-    }
-  }}
->
-  {padsHidden ? <Maximize2 size={18} /> : <Minimize2 size={18} />}
-</button>
+              type="button"
+              className={`teach-tool${padsHidden ? " is-on" : ""}`}
+              aria-label={padsHidden ? "Exit fullscreen" : "Enter fullscreen"}
+              aria-pressed={padsHidden}
+              onClick={() => {
+                if (padsHidden) exitFocusMode();
+                else enterFocusMode();
+              }}
+            >
+              {padsHidden ? <Maximize2 size={18} /> : <Minimize2 size={18} />}
+            </button>
           </div>
         </div>
 
