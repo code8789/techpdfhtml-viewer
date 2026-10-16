@@ -28,6 +28,7 @@ export type Tool =
   | "arrow"
   | "rect"
   | "circle"
+  | "triangle"
   | "laser";
 
 export type Prefs = {
@@ -2031,7 +2032,7 @@ export class Engine {
       obj = { type: "stroke", points: [origin], ...style, highlight: tool === "highlighter" };
     } else if (tool === "line" || tool === "arrow") {
       obj = { type: tool, x1: origin.x, y1: origin.y, x2: origin.x, y2: origin.y, ...style };
-    } else if (tool === "rect" || tool === "circle") {
+    } else if (tool === "rect" || tool === "circle" || tool === "triangle") {
       obj = { type: tool, x: origin.x, y: origin.y, w: 0, h: 0, ...style };
     } else {
       return;
@@ -2401,6 +2402,36 @@ export class Engine {
               borderWidth: obj.width * sx,
               opacity,
             });
+            } else if (obj.type === "triangle") {
+  const [a, b2, c] = (() => {
+    const x0 = Math.min(obj.x, obj.x + obj.w);
+    const y0 = Math.min(obj.y, obj.y + obj.h);
+    const x1 = Math.max(obj.x, obj.x + obj.w);
+    const y1 = Math.max(obj.y, obj.y + obj.h);
+    return [
+      { x: (x0 + x1) / 2, y: y0 },
+      { x: x1, y: y1 },
+      { x: x0, y: y1 },
+    ];
+  })();
+  const pts: [number, number][] = [
+    [a.x * sx, H - a.y * sy],
+    [b2.x * sx, H - b2.y * sy],
+    [c.x * sx, H - c.y * sy],
+  ];
+  // pdf-lib has no direct polygon primitive; draw three lines.
+  for (let k = 0; k < 3; k++) {
+    const p1 = pts[k];
+    const p2 = pts[(k + 1) % 3];
+    pg.drawLine({
+      start: { x: p1[0], y: p1[1] },
+      end: { x: p2[0], y: p2[1] },
+      thickness: obj.width * sx,
+      color,
+      opacity,
+    });
+  }
+}
           } else if (obj.type === "text") {
             const safe = obj.text.replace(/[^\x20-\x7E]/g, "?");
             try {
