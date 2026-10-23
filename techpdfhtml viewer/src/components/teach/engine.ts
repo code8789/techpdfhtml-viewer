@@ -136,13 +136,28 @@ type Draft = { page: Page; obj: DrawObj; origin: Pt; moved: boolean };
 
 const MOBILE_FIX = `<meta name="viewport" content="width=device-width, initial-scale=1">
 <style id="teachpdf-view-fix">
-html,body{margin:0;background:#fff;height:auto!important;min-height:100%;overflow:visible!important;}
+html,body{margin:0;background:#fff;height:auto!important;min-height:100%;overflow:visible!important;touch-action:auto!important;}
 img,video,svg,canvas{max-width:100%;height:auto;}
-video{background:#000;}
+video{
+  background:#000;
+  touch-action:manipulation!important;
+  pointer-events:auto!important;
+  -webkit-playsinline:true;
+}
 .page,.pdf-page,.pdfPage,.slide,section.page,[data-page]{
   display:block!important;visibility:visible!important;opacity:1!important;
   position:relative!important;inset:auto!important;transform:none!important;
   overflow:visible!important;height:auto!important;min-height:160px;
+}
+.iframe-wrap,.live-frame,iframe{
+  touch-action:auto!important;
+  pointer-events:auto!important;
+}
+.tap-to-play{
+  touch-action:manipulation!important;
+  pointer-events:auto!important;
+  cursor:pointer;
+  z-index:10!important;
 }
 </style>
 <script id="teachpdf-media-fix">
@@ -150,12 +165,18 @@ video{background:#000;}
   function fix(v){
     v.setAttribute("playsinline","");
     v.setAttribute("webkit-playsinline","");
-    if(!v.hasAttribute("controls")) v.controls=true;
+    v.setAttribute("controls","true");
     if(!v.getAttribute("preload")) v.preload="metadata";
+    v.style.touchAction = "manipulation";
+    v.style.pointerEvents = "auto";
   }
   function scan(root){
     if(!root.querySelectorAll) return;
     root.querySelectorAll("video").forEach(fix);
+    root.querySelectorAll(".tap-to-play").forEach(function(btn){
+      btn.style.pointerEvents = "auto";
+      btn.style.touchAction = "manipulation";
+    });
   }
   function start(){
     scan(document);
@@ -1738,6 +1759,15 @@ export class Engine {
     }
 
     if (prefs.tool === "hand") {
+      // On mobile, try to interact with video / "Tap to interact" first
+      // instead of immediately capturing the pointer for panning.
+      if (event.pointerType !== "mouse") {
+        const interacted = this.tryInteractHtml(event.clientX, event.clientY);
+        if (interacted) {
+          // Let the real gesture reach the video controls / button
+          return;
+        }
+      }
       this.beginPan(event);
       event.preventDefault();
       capture();
@@ -2238,43 +2268,104 @@ export class Engine {
     this.laser.style.display = "none";
   }
 
-  private tapHtml(x: number, y: number) {
+  /** Returns true if we handled a video or interactive element */
+  private tryInteractHtml(x: number, y: number): boolean {
     const page = this.pageAt(x, y);
     const iframe = page?.iframe;
     const doc = iframe?.contentDocument;
-    if (!iframe || !doc) return;
+    if (!iframe || !doc) return false;
+
     const rect = iframe.getBoundingClientRect();
-    if (rect.width < 2 || rect.height < 2) return;
+    if (rect.width < 2 || rect.height < 2) return false;
+
     const ix = ((x - rect.left) / rect.width) * iframe.clientWidth;
     const iy = ((y - rect.top) / rect.height) * iframe.clientHeight;
+
     let el: Element | null = null;
     try {
       el = doc.elementFromPoint(ix, iy);
     } catch {
-      return;
+      return false;
     }
-    if (!el) return;
+    if (!el) return false;
+
+    // 1. Native video → force controls + play/pause
     const video = el.closest("video");
     if (video instanceof HTMLVideoElement) {
       video.setAttribute("playsinline", "");
       video.setAttribute("webkit-playsinline", "");
       video.controls = true;
-      if (video.paused) void video.play().catch(() => this.say("Tap the video controls to play"));
-      else video.pause();
+      video.style.pointerEvents = "auto";
+      video.style.touchAction = "manipulation";
+
+      try {
+        if (video.paused) {
+          void video.play().catch(() => {
+            this.say("Tap the video play button");
+          });
+        } else {
+          video.pause();
+        }
+      } catch {
+        /* ignore */
+      }
+
       iframe.classList.add("is-live");
       this.videoFocus = true;
       this.patch({ video: true });
-      this.say("Video controls on");
-      return;
+      this.say("Video ready – use the controls");
+      return true;
     }
-    const audio = el.closest("audio");
-    if (audio instanceof HTMLAudioElement) {
-      if (audio.paused) void audio.play().catch(() => undefined);
-      else audio.pause();
-      return;
+
+    // 2. "Tap to interact" button (Animated HTML uses this)
+    const tapBtn = el.closest(".tap-to-play") as HTMLElement | null;
+    if (tapBtn) {
+      const wrap = tapBtn.closest(".iframe-wrap");
+      const live = wrap?.querySelector(".live-frame") as HTMLIFrameElement | null;
+      if (live) {
+        const src = live.getAttribute("data-src") || live.getAttribute("src");
+        if (src && !live.dataset.loaded) {
+          live.src = src;
+          live.dataset.loaded = "1";
+        }
+        tapBtn.classList.add("hidden");
+        try {
+          live.focus();
+        } catch {
+          /* ignore */
+        }
+      }
+      // Also fire a real click so any listeners inside the HTML run
+      tapBtn.click();
+      iframe.classList.add("is-live");
+      this.videoFocus = true;
+      this.patch({ video: true });
+      this.say("Interactive page unlocked");
+      return true;
     }
+
+    // 3. Any other button / link
     const button = el.closest("a,button,summary");
-    if (button instanceof HTMLElement) button.click();
+    if (button instanceof HTMLElement) {
+      button.click();
+      return true;
+    }
+
+    // 4. Nested interactive iframe – mark live so later touches work better
+    const nested = el.closest("iframe");
+    if (nested) {
+      iframe.classList.add("is-live");
+      this.videoFocus = true;
+      this.patch({ video: true });
+      return true;
+    }
+
+    return false;
+  }
+
+  private tapHtml(x: number, y: number) {
+    // Keep for the short-tap path in finishPan
+    this.tryInteractHtml(x, y);
   }
 
   private updateCurrentPage() {
