@@ -913,8 +913,105 @@ export class Engine {
 
   clearVideoFocus() {
     this.videoFocus = false;
-    this.doc?.pages.forEach((p) => p.iframe?.classList.remove("is-live"));
+    this.doc?.pages.forEach((p) => {
+      if (!p.iframe) return;
+      p.iframe.classList.remove("is-live");
+      // Keep pointer-events auto so interactive pages remain usable
+      p.iframe.style.pointerEvents = "auto";
+    });
     this.patch({ video: false });
+  }
+
+  /** Freeze heavy GIF / video animation so page scrolling stays smooth. */
+  freezeAnimations() {
+    if (!this.doc) {
+      this.say("Open a lesson first");
+      return;
+    }
+    let n = 0;
+    for (const page of this.doc.pages) {
+      // Annotated media layer
+      for (const media of page.media) {
+        if (media.kind === "video") {
+          const el = page.mediaLayer.querySelector(`[data-id="${media.id}"] video`) as HTMLVideoElement | null;
+          if (el && !el.paused) {
+            el.pause();
+            n++;
+          }
+        } else if (/\.gif($|\?)/i.test(media.src) || media.src.startsWith("data:image/gif")) {
+          const img = page.mediaLayer.querySelector(`[data-id="${media.id}"] img`) as HTMLImageElement | null;
+          if (img && !img.dataset.frozen) {
+            try {
+              const c = document.createElement("canvas");
+              c.width = img.naturalWidth || img.width || 1;
+              c.height = img.naturalHeight || img.height || 1;
+              c.getContext("2d")?.drawImage(img, 0, 0);
+              img.dataset.liveSrc = img.src;
+              img.src = c.toDataURL("image/png");
+              img.dataset.frozen = "1";
+              n++;
+            } catch {
+              /* ignore */
+            }
+          }
+        }
+      }
+      // HTML document iframes (lesson GIFs / videos inside the page)
+      const doc = page.iframe?.contentDocument;
+      if (!doc) continue;
+      for (const img of [...doc.querySelectorAll("img")]) {
+        const src = img.currentSrc || img.src || "";
+        if (!/\.gif($|\?)/i.test(src) && !src.startsWith("data:image/gif")) continue;
+        if (img.dataset.frozen) continue;
+        try {
+          const c = document.createElement("canvas");
+          c.width = img.naturalWidth || img.width || 1;
+          c.height = img.naturalHeight || img.height || 1;
+          c.getContext("2d")?.drawImage(img, 0, 0);
+          img.dataset.liveSrc = img.src;
+          img.src = c.toDataURL("image/png");
+          img.dataset.frozen = "1";
+          n++;
+        } catch {
+          /* ignore */
+        }
+      }
+      for (const video of [...doc.querySelectorAll("video")]) {
+        if (!video.paused) {
+          video.pause();
+          n++;
+        }
+      }
+    }
+    this.say(n ? `Paused ${n} animation${n === 1 ? "" : "s"}` : "Nothing to pause");
+  }
+
+  /** Restore GIFs that were frozen (videos stay paused until user plays). */
+  unfreezeAnimations() {
+    if (!this.doc) return;
+    let n = 0;
+    for (const page of this.doc.pages) {
+      for (const media of page.media) {
+        const img = page.mediaLayer.querySelector(`[data-id="${media.id}"] img`) as HTMLImageElement | null;
+        if (img?.dataset.frozen && img.dataset.liveSrc) {
+          img.src = img.dataset.liveSrc;
+          delete img.dataset.frozen;
+          delete img.dataset.liveSrc;
+          n++;
+        }
+      }
+      const doc = page.iframe?.contentDocument;
+      if (!doc) continue;
+      for (const img of [...doc.querySelectorAll("img")]) {
+        if (img.dataset.frozen && img.dataset.liveSrc) {
+          img.src = img.dataset.liveSrc;
+          delete img.dataset.frozen;
+          delete img.dataset.liveSrc;
+          n++;
+        }
+      }
+    }
+    this.say(n ? `Restored ${n} GIF${n === 1 ? "" : "s"}` : "Nothing to restore");
   }
 
   async fillThumbs(host: HTMLElement) {
@@ -1030,10 +1127,36 @@ export class Engine {
     }
     const body = doc.body;
     const root = doc.documentElement;
+
+    // Force interactive wrappers to a usable height on narrow mobile screens.
+    // Original HTML uses min(85vh, 720px) which often collapses or overlaps
+    // labels when the page is shown inside our scaled iframe.
+    for (const wrap of body.querySelectorAll(".iframe-wrap")) {
+      if (!(wrap instanceof HTMLElement)) continue;
+      const target = Math.round(Math.min(640, Math.max(280, layoutW * 0.95)));
+      wrap.style.height = `${target}px`;
+      wrap.style.maxHeight = "none";
+      wrap.style.minHeight = `${Math.round(target * 0.75)}px`;
+    }
+    for (const vid of body.querySelectorAll("video")) {
+      if (!(vid instanceof HTMLVideoElement)) continue;
+      vid.style.maxWidth = "100%";
+      vid.style.width = "100%";
+      vid.style.height = "auto";
+      vid.style.display = "block";
+      vid.controls = true;
+      vid.setAttribute("playsinline", "");
+      vid.setAttribute("webkit-playsinline", "");
+    }
+
+    // Give the layout engine a frame to apply the size changes
+    void body.offsetHeight;
+
     const sw = Math.max(root.scrollWidth, body.scrollWidth, layoutW);
     let sh = Math.max(root.scrollHeight, body.scrollHeight, 320);
+
     let stack = 0;
-    for (const el of body.querySelectorAll("img,video,canvas,svg,iframe")) {
+    for (const el of body.querySelectorAll("img,video,canvas,svg,iframe,.iframe-wrap,.page")) {
       if (!(el instanceof HTMLElement)) continue;
       const rect = el.getBoundingClientRect();
       stack = Math.max(stack, rect.bottom);
@@ -1043,16 +1166,41 @@ export class Engine {
           : el instanceof HTMLVideoElement
             ? el.videoHeight
             : 0;
-      if (rect.height < 8 && natural > 8) stack += natural;
+      if (rect.height < 8 && natural > 8) stack = Math.max(stack, rect.top + natural);
     }
+
+    // Also account for fixed/absolute labels (page-number, gif-label) that
+    // sit outside the main flow on some interactive pages.
+    for (const el of body.querySelectorAll(".page-number,.gif-label,.tap-to-play")) {
+      if (!(el instanceof HTMLElement)) continue;
+      const rect = el.getBoundingClientRect();
+      stack = Math.max(stack, rect.bottom + 12);
+    }
+
     const frameH = page.iframe?.getBoundingClientRect().height || page.baseH;
     if (stack > 8) {
       const scale = frameH > 8 ? page.baseH / frameH : 1;
       sh = Math.max(sh, stack * (Number.isFinite(scale) && scale > 0 ? scale : 1));
     }
+
+    // Prefer content width when the HTML is wider than the phone, but keep
+    // a sensible minimum so text does not crush the interactive area.
     if (sw > layoutW + 48) page.baseW = Math.min(sw, 2400);
-    page.baseH = Math.min(80000, Math.max(360, Math.ceil(sh)));
+    else page.baseW = layoutW;
+
+    page.baseH = Math.min(80000, Math.max(400, Math.ceil(sh + 24)));
     this.ensureTiles(page);
+
+    // Size the iframe itself to fill the page so touches hit the content
+    if (page.iframe) {
+      page.iframe.style.position = "absolute";
+      page.iframe.style.left = "0";
+      page.iframe.style.top = "0";
+      page.iframe.style.width = "100%";
+      page.iframe.style.height = "100%";
+      page.iframe.style.border = "0";
+      page.iframe.style.touchAction = "auto";
+    }
   }
 
   private watchHtml() {
@@ -1877,6 +2025,9 @@ export class Engine {
   };
 
   private onTouchMove = (event: TouchEvent) => {
+    // While the user is using native video controls or an interactive page,
+    // do not call preventDefault – otherwise Android Chrome blocks the controls.
+    if (this.videoFocus) return;
     if (
       this.mode === "pan" ||
       this.mode === "pinch" ||
@@ -2277,9 +2428,13 @@ export class Engine {
     const rect = iframe.getBoundingClientRect();
     if (rect.width < 2 || rect.height < 2) return false;
 
-    // Already unlocked as a real video → let every subsequent touch
-    // reach the native controls (play, seek, volume, fullscreen).
-    if (this.videoFocus && iframe.classList.contains("is-live")) {
+    // While a real video is focused, never steal touches for panning.
+    if (this.videoFocus) {
+      return true;
+    }
+
+    // Page already unlocked for interaction → keep letting touches through
+    if (iframe.classList.contains("is-live")) {
       return true;
     }
 
@@ -2294,25 +2449,42 @@ export class Engine {
     }
     if (!el) return false;
 
-    // 1. Real <video> → unlock once, show app "Video controls" bar, then pass through
+    // 1. Real <video>
     const video = el.closest("video");
     if (video instanceof HTMLVideoElement) {
       video.setAttribute("playsinline", "");
       video.setAttribute("webkit-playsinline", "");
+      video.setAttribute("controls", "true");
       video.controls = true;
       video.style.pointerEvents = "auto";
       video.style.touchAction = "manipulation";
+      video.style.maxWidth = "100%";
+      video.style.width = "100%";
+      video.style.height = "auto";
 
+      // Make sure nothing in our page shell sits above the video
+      iframe.style.pointerEvents = "auto";
+      iframe.style.touchAction = "auto";
       iframe.classList.add("is-live");
+
       this.videoFocus = true;
       this.patch({ video: true });
       this.say("Video ready – use the controls");
-      // Do NOT call play()/pause() – let the native control receive this same touch
+
+      // Focus so mobile browsers treat later taps as media gestures
+      try {
+        video.focus({ preventScroll: true });
+      } catch {
+        try {
+          video.focus();
+        } catch {
+          /* ignore */
+        }
+      }
       return true;
     }
 
-    // 2. "Tap to interact" button (Animated HTML)
-    //    Unlock the nested simulation but do NOT show the "Video controls" bar.
+    // 2. "Tap to interact" button
     const tapBtn = el.closest(".tap-to-play") as HTMLElement | null;
     if (tapBtn) {
       const wrap = tapBtn.closest(".iframe-wrap");
@@ -2332,28 +2504,31 @@ export class Engine {
       }
       tapBtn.click();
       iframe.classList.add("is-live");
-      // IMPORTANT: do not set videoFocus / patch({ video: true })
-      // so the floating "Video controls | Done" bar does not appear.
+      iframe.style.pointerEvents = "auto";
+      iframe.style.touchAction = "auto";
+      // Do NOT show the app "Video controls" bar for interactive pages
       this.say("Interactive page unlocked");
+      // Remeasure after the nested frame loads so height is correct on mobile
+      window.setTimeout(() => {
+        if (!this.alive || !page.shell.isConnected) return;
+        this.measureHtml(page, page.baseW);
+        this.layout();
+      }, 400);
       return true;
     }
 
-    // 3. Buttons / links inside the page
+    // 3. Buttons / links
     const button = el.closest("a,button,summary");
     if (button instanceof HTMLElement) {
       button.click();
       return true;
     }
 
-    // 4. Nested interactive iframe / canvas simulation already visible
-    //    (no tap-to-play overlay). Let touches through, no video bar.
+    // 4. Nested interactive content
     if (el.closest("iframe") || el.closest("canvas") || el.closest(".iframe-wrap")) {
       iframe.classList.add("is-live");
-      return true;
-    }
-
-    // 5. Page already marked live (previous unlock) → keep letting touches through
-    if (iframe.classList.contains("is-live")) {
+      iframe.style.pointerEvents = "auto";
+      iframe.style.touchAction = "auto";
       return true;
     }
 
