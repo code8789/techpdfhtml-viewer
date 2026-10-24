@@ -15,7 +15,9 @@ import {
   Maximize2,
   Minimize2,
   Minus,
+  Pause,
   Pencil,
+  Play,
   Plus,
   Redo2,
   Slash,
@@ -50,7 +52,6 @@ const Stage = memo(function Stage({
   const scrollRef = useRef<HTMLDivElement>(null);
   const sizerRef = useRef<HTMLDivElement>(null);
   const stageRef = useRef<HTMLDivElement>(null);
-
   useEffect(() => {
     const els: StageEls = {
       scroll: scrollRef.current!,
@@ -72,7 +73,6 @@ const Stage = memo(function Stage({
       onReady(null);
     };
   }, [hooksRef, onReady]);
-
   return (
     <div ref={scrollRef} className="teach-scroll">
       <div ref={sizerRef} className="teach-sizer">
@@ -123,6 +123,7 @@ export function TeachApp() {
   const [blankOpen, setBlankOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [thumbsOpen, setThumbsOpen] = useState(false);
+  const [frozen, setFrozen] = useState(false);
   const [ask, setAsk] = useState<Ask | null>(null);
   const [draft, setDraft] = useState("");
   const [ui, setUi] = useState({
@@ -138,7 +139,6 @@ export function TeachApp() {
     ready: false,
     selectedMedia: false,
   });
-
   const prefsRef = useRef<Prefs>({
     tool: "hand",
     color: COLORS[0],
@@ -159,7 +159,6 @@ export function TeachApp() {
     shapeDetect,
     laserSize,
   };
-
   const hooksRef = useRef<TeachHooks>(null!);
   hooksRef.current = {
     getPrefs: () => prefsRef.current,
@@ -208,47 +207,38 @@ export function TeachApp() {
     },
     onJump: () => setThumbsOpen(false),
   };
-
   const onReady = useCallback((engine: Engine | null) => {
     engineRef.current = engine;
   }, []);
-
   useLayoutEffect(() => {
     if (zoomRef.current) zoomRef.current.textContent = `${Math.round(zoomLive.current * 100)}%`;
   });
-
   useEffect(() => {
     engineRef.current?.notePrefs();
   }, [tool, invert, shapeDetect]);
-
   useEffect(() => {
     if (thumbsOpen && thumbRef.current) void engineRef.current?.fillThumbs(thumbRef.current);
   }, [thumbsOpen, ui.docName, ui.pageCount]);
-
   useEffect(() => {
     const node = dirRef.current;
     if (!node) return;
     node.setAttribute("webkitdirectory", "");
     node.setAttribute("directory", "");
   }, []);
-
   function closeAsk(value: string | null) {
     const resolve = askRef.current;
     askRef.current = null;
     setAsk(null);
     resolve?.(value);
   }
-
   function chooseFiles(list: FileList | null) {
     const files = list ? [...list] : [];
     if (files.length) void engineRef.current?.openFiles(files);
   }
-
   function enterFocusMode() {
     setPadsHidden(true);
     toggleNativeFullscreen();
   }
-
   function exitFocusMode() {
     setPadsHidden(false);
     if (typeof document === "undefined") return;
@@ -261,7 +251,15 @@ export function TeachApp() {
     if (document.exitFullscreen) void document.exitFullscreen().catch(() => {});
     else if (doc.webkitExitFullscreen) void doc.webkitExitFullscreen().catch(() => {});
   }
-
+  function toggleFreeze() {
+    if (frozen) {
+      engineRef.current?.unfreezeAnimations();
+      setFrozen(false);
+    } else {
+      engineRef.current?.freezeAnimations();
+      setFrozen(true);
+    }
+  }
   return (
     <div className={`teach-app${padsHidden ? " is-focus" : ""}`}>
       <header className="teach-top">
@@ -311,7 +309,6 @@ export function TeachApp() {
           </button>
         </div>
       </header>
-
       <div
         className="teach-main"
         onDragOver={(event) => event.preventDefault()}
@@ -326,7 +323,6 @@ export function TeachApp() {
         }}
       >
         <Stage hooksRef={hooksRef} onReady={onReady} />
-
         {!ui.ready && (
           <div className="teach-empty">
             <div className="teach-card">
@@ -388,9 +384,7 @@ export function TeachApp() {
             </div>
           </div>
         )}
-
         {ui.status && <div className="teach-toast">{ui.status}</div>}
-
         {ui.video && (
           <div className="teach-chip">
             Video controls
@@ -399,7 +393,6 @@ export function TeachApp() {
             </button>
           </div>
         )}
-
         {ui.selectedMedia && (
           <div className="teach-chip" style={{ bottom: "calc(4.6rem + env(safe-area-inset-bottom))" }}>
             <button
@@ -416,9 +409,9 @@ export function TeachApp() {
             </button>
           </div>
         )}
-
+        {/* Blank page chooser — always on top, works in fullscreen / focus mode */}
         {blankOpen && (
-          <div className="teach-pop" role="group" aria-label="Blank page color">
+          <div className="teach-pop teach-pop-blank" role="group" aria-label="Blank page color">
             <button
               type="button"
               className="teach-btn"
@@ -441,7 +434,6 @@ export function TeachApp() {
             </button>
           </div>
         )}
-
         <div className="teach-dock" role="toolbar" aria-label="Teaching tools">
           <div className="teach-dock-scroll">
             <button
@@ -615,6 +607,15 @@ export function TeachApp() {
             </button>
             <button
               type="button"
+              className={`teach-tool${frozen ? " is-on" : ""}`}
+              aria-label={frozen ? "Resume GIF animations" : "Pause GIF animations"}
+              aria-pressed={frozen}
+              onClick={toggleFreeze}
+            >
+              {frozen ? <Play size={18} /> : <Pause size={18} />}
+            </button>
+            <button
+              type="button"
               className={`teach-tool${settingsOpen ? " is-on" : ""}`}
               aria-label="Thickness and page options"
               onClick={() => {
@@ -646,7 +647,6 @@ export function TeachApp() {
             </button>
           </div>
         </div>
-
         {settingsOpen && (
           <div className="teach-sheet">
             <h2>Stroke and page</h2>
@@ -713,7 +713,6 @@ export function TeachApp() {
             </div>
           </div>
         )}
-
         {thumbsOpen && (
           <div className="teach-drawer">
             <div className="setting-row" style={{ marginTop: 0 }}>
@@ -725,7 +724,6 @@ export function TeachApp() {
             <div ref={thumbRef} className="thumb-list" />
           </div>
         )}
-
         {ui.progress && (
           <div className="teach-modal" role="status">
             <div className="panel">
@@ -736,7 +734,6 @@ export function TeachApp() {
             </div>
           </div>
         )}
-
         {ask && (
           <div className="teach-modal">
             <form
@@ -775,7 +772,6 @@ export function TeachApp() {
           </div>
         )}
       </div>
-
       <input
         ref={fileRef}
         className="sr-only"
@@ -812,7 +808,6 @@ export function TeachApp() {
   );
 }
 
-/* ---------- Icon helpers (exactly one of each) ---------- */
 
 function SlidersIcon() {
   return (
@@ -823,7 +818,6 @@ function SlidersIcon() {
     </svg>
   );
 }
-
 function PagesIcon() {
   return (
     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
@@ -832,7 +826,6 @@ function PagesIcon() {
     </svg>
   );
 }
-
 function PixelIcon() {
   return (
     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
@@ -843,7 +836,6 @@ function PixelIcon() {
     </svg>
   );
 }
-
 function DetectIcon() {
   return (
     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
@@ -852,7 +844,6 @@ function DetectIcon() {
     </svg>
   );
 }
-
 function TriangleIcon() {
   return (
     <svg
@@ -869,3 +860,4 @@ function TriangleIcon() {
     </svg>
   );
 }
+
