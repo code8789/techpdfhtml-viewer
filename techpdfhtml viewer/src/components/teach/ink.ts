@@ -194,7 +194,6 @@ function strokePoints(ctx: CanvasRenderingContext2D, points: Pt[]) {
 }
 
 function triangleVertices(x: number, y: number, w: number, h: number): [Pt, Pt, Pt] {
-  // Apex at top-center, base along the bottom of the bounding box.
   const x0 = Math.min(x, x + w);
   const y0 = Math.min(y, y + h);
   const x1 = Math.max(x, x + w);
@@ -307,23 +306,11 @@ export function objSvg(o: DrawObj) {
 /* --------------------------------------------------------------------------
    SHAPE DETECTION
 
-   Detection order:
-     1. Line / Arrow  (open, straight)
-     2. Triangle      (closed, 3 corners)
-     3. Rectangle     (closed, points hug bbox perimeter)
-     4. Circle        (closed, points on an ellipse, high aspect ratio)
-
-   Order matters. A hand-drawn rectangle is closer to a squashed
-   circle than to a triangle, so circle must be tested LAST. A
-   hand-drawn triangle has 3 corners, a rectangle has 4 -- that is
-   the primary distinguishing feature, so we test corner count first.
-
-   Threshold notes:
-     - Triangle:  0.14 (looser, since fat hand-drawn triangles are common)
-     - Rectangle: 0.16 (looser than triangle, because corner overshoot
-                       is normal when drawing a rect by hand)
-     - Circle:    0.16 with aspect ratio guard, so rectangles don't
-                       fall through to circle after failing rect.
+   Order:
+     1. Line / Arrow
+     2. Circle   (round, high aspect ratio — before rect so ovals win)
+     3. Triangle
+     4. Rectangle
    -------------------------------------------------------------------------- */
 
 type B = { x0: number; y0: number; x1: number; y1: number };
@@ -378,11 +365,24 @@ function fitToPolygon(points: Pt[], corners: Pt[]): number {
     }
     total += best;
   }
-  const diag = Math.hypot(
-    Math.max(...corners.map((c) => c.x)) - Math.min(...corners.map((c) => c.x)),
-    Math.max(...corners.map((c) => c.y)) - Math.min(...corners.map((c) => c.y)),
-  ) || 1;
+  const diag =
+    Math.hypot(
+      Math.max(...corners.map((c) => c.x)) - Math.min(...corners.map((c) => c.x)),
+      Math.max(...corners.map((c) => c.y)) - Math.min(...corners.map((c) => c.y)),
+    ) || 1;
   return total / points.length / diag;
+}
+
+function ellipseFitError(points: Pt[], b: B): number {
+  const cx = (b.x0 + b.x1) / 2;
+  const cy = (b.y0 + b.y1) / 2;
+  const rx = (b.x1 - b.x0) / 2 || 1;
+  const ry = (b.y1 - b.y0) / 2 || 1;
+  let err = 0;
+  for (const p of points) {
+    err += Math.abs(Math.hypot((p.x - cx) / rx, (p.y - cy) / ry) - 1);
+  }
+  return err / points.length;
 }
 
 export function snapShape(
@@ -409,6 +409,7 @@ export function snapShape(
   const closed = gap < Math.max(26, diag * 0.28);
 
   const corners = cornerIndices(points, 1.0);
+  const aspect = Math.min(bw, bh) / Math.max(bw, bh);
 
   // ---------- 1. LINE / ARROW --------------------------------------------
   if (!closed && corners.length <= 2) {
@@ -440,7 +441,16 @@ export function snapShape(
 
   if (!closed) return null;
 
-  // ---------- 2. TRIANGLE -------------------------------------------------
+  // ---------- 2. CIRCLE / ELLIPSE (before rect so round shapes win) -------
+  // Few sharp corners + reasonably round aspect + good ellipse fit.
+  if (aspect > 0.55 && corners.length <= 3) {
+    const err = ellipseFitError(points, b);
+    if (err < 0.22) {
+      return { type: "circle", x: b.x0, y: b.y0, w: bw, h: bh, ...style };
+    }
+  }
+
+  // ---------- 3. TRIANGLE -------------------------------------------------
   if (corners.length >= 2 && corners.length <= 4) {
     const c3 = corners.slice(0, 3).map((i) => points[i]);
     if (c3.length === 3) {
@@ -451,9 +461,7 @@ export function snapShape(
     }
   }
 
-  // ---------- 3. RECTANGLE -----------------------------------------------
-  // Test rectangle before circle so hand-drawn rects don't get
-  // misclassified as squashed circles.
+  // ---------- 4. RECTANGLE -----------------------------------------------
   {
     const rectCorners: Pt[] = [
       { x: b.x0, y: b.y0 },
@@ -467,22 +475,11 @@ export function snapShape(
     }
   }
 
-  // ---------- 4. CIRCLE / ELLIPSE ----------------------------------------
-  {
-    const aspect = Math.min(bw, bh) / Math.max(bw, bh);
-    if (aspect > 0.5) {
-      const cx = (b.x0 + b.x1) / 2;
-      const cy = (b.y0 + b.y1) / 2;
-      const rx = bw / 2 || 1;
-      const ry = bh / 2 || 1;
-      let err = 0;
-      for (const p of points) {
-        err += Math.abs(Math.hypot((p.x - cx) / rx, (p.y - cy) / ry) - 1);
-      }
-      err /= points.length;
-      if (err < 0.16) {
-        return { type: "circle", x: b.x0, y: b.y0, w: bw, h: bh, ...style };
-      }
+  // ---------- 5. CIRCLE fallback (looser, after rect failed) --------------
+  if (aspect > 0.45) {
+    const err = ellipseFitError(points, b);
+    if (err < 0.28) {
+      return { type: "circle", x: b.x0, y: b.y0, w: bw, h: bh, ...style };
     }
   }
 
