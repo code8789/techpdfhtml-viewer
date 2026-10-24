@@ -153,6 +153,38 @@ video{
   touch-action:auto!important;
   pointer-events:auto!important;
 }
+.iframe-wrap{
+  width:100%!important;
+  max-width:100%!important;
+  height:auto!important;
+  min-height:280px!important;
+  aspect-ratio:1 / 1.05;
+  margin:0 auto!important;
+}
+.live-frame, .iframe-wrap > iframe{
+  width:100%!important;
+  height:100%!important;
+  min-height:280px!important;
+  border:0!important;
+  display:block!important;
+}
+.page video, video{
+  width:100%!important;
+  max-width:100%!important;
+  height:auto!important;
+  max-height:none!important;
+  display:block!important;
+  margin:0 auto!important;
+}
+.page img{
+  max-width:100%!important;
+  height:auto!important;
+  max-height:none!important;
+}
+.page{
+  padding:10px!important;
+  min-height:auto!important;
+}
 .tap-to-play{
   touch-action:manipulation!important;
   pointer-events:auto!important;
@@ -533,9 +565,33 @@ export class Engine {
       this.lastInvert = invert;
       if (this.doc?.kind === "pdf") this.mountVisible(true);
     }
-    if (this.hooks.getPrefs().tool !== "hand") this.clearVideoFocus();
-    if (this.hooks.getPrefs().tool !== "hand") this.clearSelection();
+    const tool = this.hooks.getPrefs().tool;
+    if (tool !== "hand") {
+      this.clearVideoFocus();
+      this.clearSelection();
+      // Drawing / text tools must receive touches — HTML iframes would steal them
+      this.setHtmlPointerPass(false);
+    } else {
+      // Hand tool: allow taps into video / interactive HTML
+      this.setHtmlPointerPass(true);
+    }
     this.syncHistory();
+  }
+
+  /** When false, HTML iframes ignore pointers so pen/text/shapes can draw on top. */
+  private setHtmlPointerPass(pass: boolean) {
+    if (!this.doc) return;
+    for (const page of this.doc.pages) {
+      const iframe = page.iframe;
+      if (!iframe) continue;
+      if (pass) {
+        iframe.style.pointerEvents = "auto";
+        iframe.style.touchAction = "auto";
+      } else {
+        iframe.style.pointerEvents = "none";
+        iframe.style.touchAction = "none";
+      }
+    }
   }
 
   async openFiles(files: File[]) {
@@ -1128,28 +1184,71 @@ export class Engine {
     const body = doc.body;
     const root = doc.documentElement;
 
-    // Force interactive wrappers to a usable height on narrow mobile screens.
-    // Original HTML uses min(85vh, 720px) which often collapses or overlaps
-    // labels when the page is shown inside our scaled iframe.
+    // Mobile: give interactive blocks nearly full page width and a tall
+    // nearly-square height so CRT / atom sims are not squashed.
+    const contentW = Math.max(260, layoutW - 24);
+    // Prefer ~1:1 up to ~1.15 height ratio; floor so small phones still usable
+    const interactH = Math.round(
+      Math.min(720, Math.max(contentW * 1.05, Math.min(contentW * 1.2, 560))),
+    );
+
     for (const wrap of body.querySelectorAll(".iframe-wrap")) {
       if (!(wrap instanceof HTMLElement)) continue;
-      const target = Math.round(Math.min(640, Math.max(280, layoutW * 0.95)));
-      wrap.style.height = `${target}px`;
+      wrap.style.boxSizing = "border-box";
+      wrap.style.width = "100%";
+      wrap.style.maxWidth = "100%";
+      wrap.style.height = `${interactH}px`;
+      wrap.style.minHeight = `${interactH}px`;
       wrap.style.maxHeight = "none";
-      wrap.style.minHeight = `${Math.round(target * 0.75)}px`;
+      wrap.style.margin = "0 auto";
+      wrap.style.overflow = "hidden";
+      for (const frame of wrap.querySelectorAll("iframe, .live-frame")) {
+        if (!(frame instanceof HTMLElement)) continue;
+        frame.style.width = "100%";
+        frame.style.height = "100%";
+        frame.style.minHeight = `${interactH}px`;
+        frame.style.border = "0";
+        frame.style.display = "block";
+      }
     }
+
     for (const vid of body.querySelectorAll("video")) {
       if (!(vid instanceof HTMLVideoElement)) continue;
+      vid.style.boxSizing = "border-box";
       vid.style.maxWidth = "100%";
       vid.style.width = "100%";
       vid.style.height = "auto";
+      vid.style.maxHeight = "none";
       vid.style.display = "block";
+      vid.style.margin = "0 auto";
       vid.controls = true;
       vid.setAttribute("playsinline", "");
       vid.setAttribute("webkit-playsinline", "");
+      // If metadata known, reserve space so layout does not jump/compress
+      if (vid.videoWidth > 0 && vid.videoHeight > 0) {
+        const ratio = vid.videoHeight / vid.videoWidth;
+        vid.style.aspectRatio = `${vid.videoWidth} / ${vid.videoHeight}`;
+        const ideal = Math.round(contentW * ratio);
+        if (ideal > 120) vid.style.minHeight = `${Math.min(ideal, 720)}px`;
+      } else {
+        vid.style.minHeight = `${Math.round(contentW * 0.56)}px`;
+      }
     }
 
-    // Give the layout engine a frame to apply the size changes
+    for (const img of body.querySelectorAll("img")) {
+      if (!(img instanceof HTMLImageElement)) continue;
+      img.style.maxWidth = "100%";
+      img.style.height = "auto";
+      img.style.maxHeight = "none";
+    }
+
+    // Page chrome from the lesson HTML — reduce padding that steals height
+    for (const pageEl of body.querySelectorAll(".page, section.page")) {
+      if (!(pageEl instanceof HTMLElement)) continue;
+      pageEl.style.minHeight = "auto";
+      pageEl.style.padding = "10px";
+    }
+
     void body.offsetHeight;
 
     const sw = Math.max(root.scrollWidth, body.scrollWidth, layoutW);
@@ -1188,7 +1287,10 @@ export class Engine {
     if (sw > layoutW + 48) page.baseW = Math.min(sw, 2400);
     else page.baseW = layoutW;
 
-    page.baseH = Math.min(80000, Math.max(400, Math.ceil(sh + 24)));
+    // Ensure interactive pages are tall enough that the sim is not clipped
+    const hasInteract = !!body.querySelector(".iframe-wrap, .live-frame, video");
+    const minH = hasInteract ? Math.max(480, interactH + 80) : 400;
+    page.baseH = Math.min(80000, Math.max(minH, Math.ceil(sh + 32)));
     this.ensureTiles(page);
 
     // Size the iframe itself to fill the page so touches hit the content
@@ -1969,6 +2071,8 @@ export class Engine {
       capture();
       return;
     }
+    // Ensure HTML content cannot steal this stroke
+    this.setHtmlPointerPass(false);
     this.beginShape(page, prefs.tool, event);
     event.preventDefault();
     capture();
@@ -2025,9 +2129,8 @@ export class Engine {
   };
 
   private onTouchMove = (event: TouchEvent) => {
-    // While the user is using native video controls or an interactive page,
-    // do not call preventDefault – otherwise Android Chrome blocks the controls.
-    if (this.videoFocus) return;
+    // Allow native video controls to receive moves only when idle (not drawing/panning).
+    if (this.videoFocus && this.mode === "none") return;
     if (
       this.mode === "pan" ||
       this.mode === "pinch" ||
@@ -2428,16 +2531,6 @@ export class Engine {
     const rect = iframe.getBoundingClientRect();
     if (rect.width < 2 || rect.height < 2) return false;
 
-    // While a real video is focused, never steal touches for panning.
-    if (this.videoFocus) {
-      return true;
-    }
-
-    // Page already unlocked for interaction → keep letting touches through
-    if (iframe.classList.contains("is-live")) {
-      return true;
-    }
-
     const ix = ((x - rect.left) / rect.width) * iframe.clientWidth;
     const iy = ((y - rect.top) / rect.height) * iframe.clientHeight;
 
@@ -2448,6 +2541,14 @@ export class Engine {
       return false;
     }
     if (!el) return false;
+
+    // While video is focused, only pass through when the finger is still on a video
+    if (this.videoFocus) {
+      if (el.closest("video")) return true;
+      // Tapped outside the video → exit video mode so pan works again
+      this.clearVideoFocus();
+      return false;
+    }
 
     // 1. Real <video>
     const video = el.closest("video");
@@ -2524,12 +2625,18 @@ export class Engine {
       return true;
     }
 
-    // 4. Nested interactive content
-    if (el.closest("iframe") || el.closest("canvas") || el.closest(".iframe-wrap")) {
-      iframe.classList.add("is-live");
-      iframe.style.pointerEvents = "auto";
-      iframe.style.touchAction = "auto";
-      return true;
+    // 4. Nested interactive content only if already unlocked (tap-to-play done)
+    //    or the user is clearly on a control (input/slider/button inside wrap)
+    if (iframe.classList.contains("is-live")) {
+      if (
+        el.closest("iframe") ||
+        el.closest("canvas") ||
+        el.closest("input") ||
+        el.closest("button") ||
+        el.closest(".iframe-wrap")
+      ) {
+        return true;
+      }
     }
 
     return false;
