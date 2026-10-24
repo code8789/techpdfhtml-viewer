@@ -1759,14 +1759,13 @@ export class Engine {
     }
 
     if (prefs.tool === "hand") {
-      // On mobile, try to interact with video / "Tap to interact" first
-      // instead of immediately capturing the pointer for panning.
-      if (event.pointerType !== "mouse") {
-        const interacted = this.tryInteractHtml(event.clientX, event.clientY);
-        if (interacted) {
-          // Let the real gesture reach the video controls / button
-          return;
-        }
+      // Prefer letting video controls and interactive HTML receive the touch.
+      // Only start a pan when the touch is clearly on empty page chrome.
+      const interacted = this.tryInteractHtml(event.clientX, event.clientY);
+      if (interacted) {
+        // Do not preventDefault / setPointerCapture – the browser must
+        // deliver this gesture to the <video> or nested interactive page.
+        return;
       }
       this.beginPan(event);
       event.preventDefault();
@@ -2268,7 +2267,7 @@ export class Engine {
     this.laser.style.display = "none";
   }
 
-  /** Returns true if we handled a video or interactive element */
+  /** Returns true if the touch should be left for the HTML content (no pan/capture). */
   private tryInteractHtml(x: number, y: number): boolean {
     const page = this.pageAt(x, y);
     const iframe = page?.iframe;
@@ -2277,6 +2276,12 @@ export class Engine {
 
     const rect = iframe.getBoundingClientRect();
     if (rect.width < 2 || rect.height < 2) return false;
+
+    // Already unlocked as a real video → let every subsequent touch
+    // reach the native controls (play, seek, volume, fullscreen).
+    if (this.videoFocus && iframe.classList.contains("is-live")) {
+      return true;
+    }
 
     const ix = ((x - rect.left) / rect.width) * iframe.clientWidth;
     const iy = ((y - rect.top) / rect.height) * iframe.clientHeight;
@@ -2289,7 +2294,7 @@ export class Engine {
     }
     if (!el) return false;
 
-    // 1. Native video → force controls + play/pause
+    // 1. Real <video> → unlock once, show app "Video controls" bar, then pass through
     const video = el.closest("video");
     if (video instanceof HTMLVideoElement) {
       video.setAttribute("playsinline", "");
@@ -2298,26 +2303,16 @@ export class Engine {
       video.style.pointerEvents = "auto";
       video.style.touchAction = "manipulation";
 
-      try {
-        if (video.paused) {
-          void video.play().catch(() => {
-            this.say("Tap the video play button");
-          });
-        } else {
-          video.pause();
-        }
-      } catch {
-        /* ignore */
-      }
-
       iframe.classList.add("is-live");
       this.videoFocus = true;
       this.patch({ video: true });
       this.say("Video ready – use the controls");
+      // Do NOT call play()/pause() – let the native control receive this same touch
       return true;
     }
 
-    // 2. "Tap to interact" button (Animated HTML uses this)
+    // 2. "Tap to interact" button (Animated HTML)
+    //    Unlock the nested simulation but do NOT show the "Video controls" bar.
     const tapBtn = el.closest(".tap-to-play") as HTMLElement | null;
     if (tapBtn) {
       const wrap = tapBtn.closest(".iframe-wrap");
@@ -2335,28 +2330,30 @@ export class Engine {
           /* ignore */
         }
       }
-      // Also fire a real click so any listeners inside the HTML run
       tapBtn.click();
       iframe.classList.add("is-live");
-      this.videoFocus = true;
-      this.patch({ video: true });
+      // IMPORTANT: do not set videoFocus / patch({ video: true })
+      // so the floating "Video controls | Done" bar does not appear.
       this.say("Interactive page unlocked");
       return true;
     }
 
-    // 3. Any other button / link
+    // 3. Buttons / links inside the page
     const button = el.closest("a,button,summary");
     if (button instanceof HTMLElement) {
       button.click();
       return true;
     }
 
-    // 4. Nested interactive iframe – mark live so later touches work better
-    const nested = el.closest("iframe");
-    if (nested) {
+    // 4. Nested interactive iframe / canvas simulation already visible
+    //    (no tap-to-play overlay). Let touches through, no video bar.
+    if (el.closest("iframe") || el.closest("canvas") || el.closest(".iframe-wrap")) {
       iframe.classList.add("is-live");
-      this.videoFocus = true;
-      this.patch({ video: true });
+      return true;
+    }
+
+    // 5. Page already marked live (previous unlock) → keep letting touches through
+    if (iframe.classList.contains("is-live")) {
       return true;
     }
 
