@@ -1622,11 +1622,10 @@ export class Engine {
   private mountVisible(force: boolean) {
     if (!this.doc) return;
     const keep = this.draft?.page;
-    // HTML with embedded video: keep fewer pages mounted to stay under memory limits
-    const margin = this.doc.kind === "html" ? 500 : 900;
+    const margin = this.doc.kind === "html" ? 700 : 900;
     for (const page of this.doc.pages) {
       if (page !== keep && !this.near(page.shell, margin)) {
-        if (page.mounted || page.iframe?.src) this.unmountPage(page);
+        if (page.mounted) this.unmountPage(page);
         continue;
       }
       this.mountPage(page, force);
@@ -1687,18 +1686,9 @@ export class Engine {
     page.pdfPage?.cleanup();
     page.pdfPage = undefined;
     for (const tile of page.tiles) this.dropTile(tile);
-    // Free memory for large HTML pages (base64 video) when scrolled far away.
-    // dataset.src is kept so the page can reload when it comes back into view.
-    const iframe = page.iframe;
-    if (iframe?.src) {
-      if (!iframe.dataset.src) iframe.dataset.src = iframe.src;
-      try {
-        iframe.src = "about:blank";
-      } catch {
-        /* ignore */
-      }
-      iframe.removeAttribute("src");
-    }
+    // Keep HTML iframe src loaded. Unloading it (about:blank) broke
+    // "Tap to interact" and pinch when the user scrolled back.
+    // Ink tiles / PDF canvases above are enough to free GPU memory.
   }
 
   private dropTile(tile: Tile) {
@@ -2052,6 +2042,8 @@ export class Engine {
       const pts = [...this.pointers.values()];
       this.mode = "pinch";
       this.els.stage.classList.add("is-pinching");
+      // Interactive HTML iframes steal the second finger — disable them during pinch
+      this.setHtmlPointerPass(false);
       this.pinchDist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y) || 1;
       this.pinchStartZoom = this.userZoom;
       this.lastMid = { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 };
@@ -2222,7 +2214,8 @@ export class Engine {
         this.mode = "none";
         this.blockUntilUp = this.pointers.size > 0;
         this.els.stage.classList.remove("is-pinching");
-        // Defer commit so the last visual frame is not dropped on heavy HTML
+        // Restore HTML hit-testing if Hand tool is active
+        if (this.hooks.getPrefs().tool === "hand") this.setHtmlPointerPass(true);
         window.clearTimeout(this.pinchRerenderTimer);
         this.pinchRerenderTimer = window.setTimeout(() => {
           if (this.mode === "pinch") return;
@@ -2698,14 +2691,14 @@ export class Engine {
       return true;
     }
 
-    // 2. "Tap to interact" button
+    // 2. "Tap to interact" button (works again after scrolling away and back)
     const tapBtn = el.closest(".tap-to-play") as HTMLElement | null;
     if (tapBtn) {
       const wrap = tapBtn.closest(".iframe-wrap");
       const live = wrap?.querySelector(".live-frame") as HTMLIFrameElement | null;
       if (live) {
-        const src = live.getAttribute("data-src") || live.getAttribute("src");
-        if (src && !live.dataset.loaded) {
+        const src = live.getAttribute("data-src") || live.getAttribute("src") || live.dataset.src || "";
+        if (src && (live.getAttribute("src") !== src || !live.dataset.loaded)) {
           live.src = src;
           live.dataset.loaded = "1";
         }
@@ -2716,13 +2709,15 @@ export class Engine {
           /* ignore */
         }
       }
-      tapBtn.click();
+      try {
+        tapBtn.click();
+      } catch {
+        /* ignore */
+      }
       iframe.classList.add("is-live");
       iframe.style.pointerEvents = "auto";
       iframe.style.touchAction = "auto";
-      // Do NOT show the app "Video controls" bar for interactive pages
       this.say("Interactive page unlocked");
-      // Remeasure after the nested frame loads so height is correct on mobile
       window.setTimeout(() => {
         if (!this.alive || !page.shell.isConnected) return;
         this.measureHtml(page, page.baseW);
@@ -2738,16 +2733,19 @@ export class Engine {
       return true;
     }
 
-    // 4. Nested interactive content only if already unlocked (tap-to-play done)
-    //    or the user is clearly on a control (input/slider/button inside wrap)
+    // 4. Nested interactive content only if already unlocked
     if (iframe.classList.contains("is-live")) {
       if (
         el.closest("iframe") ||
         el.closest("canvas") ||
         el.closest("input") ||
         el.closest("button") ||
+        el.closest("select") ||
         el.closest(".iframe-wrap")
       ) {
+        // Ensure outer frame still accepts touches after scroll-back
+        iframe.style.pointerEvents = "auto";
+        iframe.style.touchAction = "auto";
         return true;
       }
     }
