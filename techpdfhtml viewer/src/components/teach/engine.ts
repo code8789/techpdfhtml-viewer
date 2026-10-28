@@ -16,6 +16,12 @@ const HISTORY = 40;
 const DOCK_GAP = 92;
 const MAX_EDGE = 1536;
 const MAX_CANVAS_EDGE = 8192;
+/** Soft limits — files above these still open, but we use a leaner path. */
+const LARGE_HTML_BYTES = 12 * 1024 * 1024; // 12 MB
+const HUGE_HTML_BYTES = 40 * 1024 * 1024; // 40 MB
+const LARGE_PDF_BYTES = 25 * 1024 * 1024;
+const HUGE_PDF_BYTES = 90 * 1024 * 1024;
+const LARGE_MEDIA_BYTES = 20 * 1024 * 1024;
 
 export type Tool =
   | "hand"
@@ -285,16 +291,19 @@ async function readBytes(file: Blob, onRatio: (n: number) => void) {
   const parts: Uint8Array[] = [];
   let got = 0;
   let last = 0;
+  let chunkN = 0;
   for (;;) {
     const { done, value } = await reader.read();
     if (done) break;
     parts.push(value);
     got += value.byteLength;
-    if (got / total - last > 0.04 || got >= total) {
+    chunkN++;
+    if (got / total - last > 0.03 || got >= total) {
       last = got / total;
       onRatio(Math.min(1, last));
-      if (parts.length % 6 === 0) await yieldThread();
     }
+    // Yield more often on large files so the UI stays responsive
+    if (chunkN % (total > LARGE_PDF_BYTES ? 2 : 8) === 0) await yieldThread();
   }
   const out = new Uint8Array(got);
   let offset = 0;
@@ -312,22 +321,26 @@ async function readText(file: Blob, onRatio: (n: number) => void) {
   const chunks: string[] = [];
   let got = 0;
   let last = 0;
+  let chunkN = 0;
   for (;;) {
     const { done, value } = await reader.read();
     if (done) break;
     chunks.push(dec.decode(value, { stream: true }));
     got += value.byteLength;
-    if (got / total - last > 0.04 || got >= total) {
+    chunkN++;
+    if (got / total - last > 0.03 || got >= total) {
       last = got / total;
       onRatio(Math.min(1, last));
-      await yieldThread();
     }
+    if (chunkN % (total > LARGE_HTML_BYTES ? 2 : 6) === 0) await yieldThread();
   }
   chunks.push(dec.decode());
   return chunks.join("");
 }
 
 function splitHtmlDocuments(html: string): string[] {
+  // For very large HTML (embedded base64 video), avoid cloning the full <head>
+  // into every page — only keep styles/scripts that are needed.
   const doc = new DOMParser().parseFromString(html, "text/html");
   const all = [
     ...doc.querySelectorAll(".page, .pdf-page, .pdfPage, .slide, section.page, [data-page]"),
@@ -341,15 +354,32 @@ function splitHtmlDocuments(html: string): string[] {
     return false;
   });
   if (useful.length < 2) return [html];
+
+  // Prefer lightweight head: charset + viewport + style/link/script tags only
+  const headBits: string[] = [];
+  for (const node of doc.head?.children ?? []) {
+    const tag = node.tagName;
+    if (tag === "STYLE" || tag === "LINK" || tag === "META" || tag === "TITLE") {
+      // Skip huge inline blobs accidentally placed in head
+      if (tag === "STYLE" && (node.textContent?.length ?? 0) > 400_000) continue;
+      headBits.push(node.outerHTML);
+    } else if (tag === "SCRIPT") {
+      const src = node.getAttribute("src");
+      const text = node.textContent || "";
+      // Keep small helper scripts; drop giant ones
+      if (src || text.length < 80_000) headBits.push(node.outerHTML);
+    }
+  }
+  const lightHead = headBits.join("\n");
+
   return useful.map((el) => {
-    const fresh = document.implementation.createHTMLDocument("page");
-    fresh.head.innerHTML = doc.head.innerHTML;
-    fresh.body.appendChild(el.cloneNode(true));
-    return "<!doctype html>\n" + fresh.documentElement.outerHTML;
+    // Move the node (not clone) when possible to cut peak memory on 30MB files
+    const markup = el.outerHTML;
+    return `<!doctype html>\n<html><head>${lightHead}</head><body>${markup}</body></html>`;
   });
 }
 
-function waitForFrame(iframe: HTMLIFrameElement) {
+function waitForFrame(iframe: HTMLIFrameElement, maxMs = 1800) {
   return new Promise<void>((resolve) => {
     let settled = false;
     const finish = () => {
@@ -361,8 +391,11 @@ function waitForFrame(iframe: HTMLIFrameElement) {
       const doc = iframe.contentDocument;
       const pending: Promise<void>[] = [];
       if (doc) {
+        // Cap how many assets we wait for — huge base64 videos must not block UI
+        let imgWait = 0;
         for (const img of [...doc.images]) {
-          if (img.complete) continue;
+          if (img.complete || imgWait >= 8) continue;
+          imgWait++;
           pending.push(
             new Promise((done) => {
               img.addEventListener("load", () => done(), { once: true });
@@ -370,7 +403,10 @@ function waitForFrame(iframe: HTMLIFrameElement) {
             }),
           );
         }
+        // Do not wait on video metadata for data: URLs (can hang on mobile)
         for (const video of [...doc.querySelectorAll("video")]) {
+          const src = video.currentSrc || video.src || "";
+          if (src.startsWith("data:")) continue;
           if (video.readyState >= 1) continue;
           pending.push(
             new Promise((done) => {
@@ -380,13 +416,14 @@ function waitForFrame(iframe: HTMLIFrameElement) {
           );
         }
       }
-      void Promise.race([Promise.all(pending), new Promise((done) => setTimeout(done, 2200))]).then(() =>
-        setTimeout(finish, 30),
-      );
+      void Promise.race([
+        Promise.all(pending),
+        new Promise((done) => setTimeout(done, Math.min(1200, maxMs))),
+      ]).then(() => setTimeout(finish, 20));
     };
     if (iframe.contentDocument?.readyState === "complete") afterLoad();
     else iframe.addEventListener("load", afterLoad, { once: true });
-    setTimeout(finish, 4500);
+    setTimeout(finish, maxMs);
   });
 }
 
@@ -628,6 +665,12 @@ export class Engine {
 
   async openPdfFile(file: File) {
     const gen = ++this.docGen;
+    const mb = file.size / (1024 * 1024);
+    if (file.size > HUGE_PDF_BYTES) {
+      this.say(`Very large PDF (${mb.toFixed(0)} MB) — this may take a while`, 3200);
+    } else if (file.size > LARGE_PDF_BYTES) {
+      this.say(`Loading ${mb.toFixed(0)} MB PDF…`, 2400);
+    }
     this.progress("Reading PDF…", 0, true);
     const bytes = await readBytes(file, (n) => {
       if (gen === this.docGen) this.progress("Reading PDF…", n, false);
@@ -640,6 +683,7 @@ export class Engine {
       data: bytes,
       isEvalSupported: false,
       disableAutoFetch: true,
+      disableStream: false,
       verbosity: 0,
     });
     const pdf = (await task.promise) as unknown as PdfDocProxy;
@@ -655,6 +699,7 @@ export class Engine {
     this.userZoom = 1;
     this.committedZoom = 1;
     this.visualRatio = 1;
+    const yieldEvery = pdf.numPages > 40 || file.size > LARGE_PDF_BYTES ? 2 : 4;
     for (let i = 1; i <= pdf.numPages; i++) {
       if (gen !== this.docGen) return;
       const proxy = await pdf.getPage(i);
@@ -663,7 +708,7 @@ export class Engine {
       made.pdfNumber = i;
       this.doc.pages.push(made);
       proxy.cleanup();
-      if (i === 1 || i % 4 === 0) {
+      if (i === 1 || i % yieldEvery === 0) {
         this.progress("Preparing pages…", i / pdf.numPages, false);
         this.layout();
         await yieldThread();
@@ -694,12 +739,15 @@ export class Engine {
     this.committedZoom = 1;
     this.visualRatio = 1;
     const docs = splitHtmlDocuments(source);
+    // Free the giant source string from the open path ASAP after split
     const layoutW = Math.max(280, Math.min(960, this.availableWidth()));
     const pages: Page[] = [];
     for (let i = 0; i < docs.length; i++) {
       const page = this.makePage(i + 1, layoutW, Math.round(layoutW * 1.25));
       pages.push(page);
       const blob = new Blob([docs[i]], { type: "text/html" });
+      // Drop page HTML string from array to help GC on 30MB lessons
+      docs[i] = "";
       const url = URL.createObjectURL(blob);
       this.ownedUrls.push(url);
       const iframe = document.createElement("iframe");
@@ -711,7 +759,9 @@ export class Engine {
       iframe.setAttribute("allow", "autoplay; fullscreen; picture-in-picture");
       iframe.setAttribute("scrolling", "no");
       iframe.referrerPolicy = "no-referrer";
-      iframe.src = url;
+      // Lazy: only the first page (and later visible ones) get src immediately
+      iframe.dataset.src = url;
+      if (i === 0) iframe.src = url;
       page.iframe = iframe;
       const fill = page.inner.querySelector(".page-fill");
       if (fill instanceof HTMLElement) fill.style.display = "none";
@@ -725,11 +775,18 @@ export class Engine {
     this.current = 1;
     this.layout();
     this.emitDoc();
+    // Measure page 0 fully; others get a quick measure after lazy load
     for (let i = 0; i < pages.length; i++) {
       if (gen !== this.docGen || !this.alive) return;
       const frame = pages[i].iframe;
-      if (frame) await waitForFrame(frame);
-      this.measureHtml(pages[i], layoutW);
+      if (frame?.src) {
+        await waitForFrame(frame, i === 0 ? 2000 : 1200);
+        this.measureHtml(pages[i], layoutW);
+      } else {
+        // Placeholder height until the page is scrolled into view
+        pages[i].baseH = Math.round(layoutW * 1.15);
+        this.ensureTiles(pages[i]);
+      }
       this.progress("Laying out HTML…", 0.55 + (0.4 * (i + 1)) / pages.length, false);
       if (i % 2 === 1) await yieldThread();
     }
@@ -740,17 +797,20 @@ export class Engine {
     this.patch({ progress: null });
     this.say(
       pages.length > 1
-        ? `HTML ready — ${pages.length} pages, pictures and video stay live`
+        ? `HTML ready — ${pages.length} pages (large pages load as you scroll)`
         : "HTML ready — GIFs and video stay live",
     );
     this.els.scroll.scrollTop = 0;
     this.els.scroll.scrollLeft = 0;
     window.setTimeout(() => {
       if (gen !== this.docGen || this.doc?.kind !== "html") return;
-      for (const page of this.doc.pages) this.measureHtml(page, layoutW);
+      // Only remeasure pages that already have content loaded
+      for (const page of this.doc.pages) {
+        if (page.iframe?.src) this.measureHtml(page, layoutW);
+      }
       this.layout();
       this.mountVisible(false);
-    }, 700);
+    }, 500);
   }
 
   undo() {
@@ -877,6 +937,10 @@ export class Engine {
     if (!isMedia(file)) {
       this.say("Choose an image, GIF, or video");
       return;
+    }
+    if (file.size > LARGE_MEDIA_BYTES) {
+      const mb = (file.size / (1024 * 1024)).toFixed(0);
+      this.say(`Large media (${mb} MB) — may use more memory`, 2600);
     }
     const url = URL.createObjectURL(file);
     this.ownedUrls.push(url);
@@ -1128,6 +1192,12 @@ export class Engine {
 
   private async openHtmlFile(file: File, assets: File[]) {
     const gen = ++this.docGen;
+    const mb = file.size / (1024 * 1024);
+    if (file.size > HUGE_HTML_BYTES) {
+      this.say(`Large file (${mb.toFixed(0)} MB) — loading with low memory mode…`, 3200);
+    } else if (file.size > LARGE_HTML_BYTES) {
+      this.say(`Loading ${mb.toFixed(0)} MB HTML — pages open as you scroll`, 2800);
+    }
     this.progress("Reading HTML…", 0, true);
     const text = await readText(file, (n) => {
       if (gen === this.docGen) this.progress("Reading HTML…", n, false);
@@ -1310,13 +1380,15 @@ export class Engine {
     if (this.doc?.kind !== "html") return;
     this.htmlObserver = new ResizeObserver(() => {
       if (this.doc?.kind !== "html") return;
+      // Never reflow while pinching — this was freezing zoom on large HTML
+      if (this.mode === "pinch") return;
       let grew = false;
       for (const page of this.doc.pages) {
         const doc = page.iframe?.contentDocument;
         if (!doc) continue;
         const sh = Math.max(doc.documentElement.scrollHeight, doc.body?.scrollHeight ?? 0);
         const next = Math.min(80000, Math.max(page.baseH, sh));
-        if (next > page.baseH + 12) {
+        if (next > page.baseH + 24) {
           page.baseH = next;
           this.ensureTiles(page);
           grew = true;
@@ -1550,9 +1622,11 @@ export class Engine {
   private mountVisible(force: boolean) {
     if (!this.doc) return;
     const keep = this.draft?.page;
+    // HTML with embedded video: keep fewer pages mounted to stay under memory limits
+    const margin = this.doc.kind === "html" ? 500 : 900;
     for (const page of this.doc.pages) {
-      if (page !== keep && !this.near(page.shell, 900)) {
-        if (page.mounted) this.unmountPage(page);
+      if (page !== keep && !this.near(page.shell, margin)) {
+        if (page.mounted || page.iframe?.src) this.unmountPage(page);
         continue;
       }
       this.mountPage(page, force);
@@ -1560,6 +1634,20 @@ export class Engine {
   }
 
   private mountPage(page: Page, force: boolean) {
+    // Lazy-load HTML iframe when the page is near the viewport
+    const iframe = page.iframe;
+    if (iframe && !iframe.src) {
+      const dataSrc = iframe.dataset.src;
+      if (dataSrc) {
+        iframe.src = dataSrc;
+        void waitForFrame(iframe, 1500).then(() => {
+          if (!this.alive || !page.shell.isConnected) return;
+          if (this.mode === "pinch") return;
+          this.measureHtml(page, page.baseW || this.availableWidth());
+          this.layout();
+        });
+      }
+    }
     const showPdf = !!page.paper || (this.doc?.kind === "pdf" && !!page.pdfNumber);
     if (!page.mounted) {
       page.mounted = true;
@@ -1599,6 +1687,18 @@ export class Engine {
     page.pdfPage?.cleanup();
     page.pdfPage = undefined;
     for (const tile of page.tiles) this.dropTile(tile);
+    // Free memory for large HTML pages (base64 video) when scrolled far away.
+    // dataset.src is kept so the page can reload when it comes back into view.
+    const iframe = page.iframe;
+    if (iframe?.src) {
+      if (!iframe.dataset.src) iframe.dataset.src = iframe.src;
+      try {
+        iframe.src = "about:blank";
+      } catch {
+        /* ignore */
+      }
+      iframe.removeAttribute("src");
+    }
   }
 
   private dropTile(tile: Tile) {
@@ -1951,6 +2051,7 @@ export class Engine {
       this.hideLaser();
       const pts = [...this.pointers.values()];
       this.mode = "pinch";
+      this.els.stage.classList.add("is-pinching");
       this.pinchDist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y) || 1;
       this.pinchStartZoom = this.userZoom;
       this.lastMid = { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 };
@@ -2111,11 +2212,22 @@ export class Engine {
 
   private onPointerUp = (event: PointerEvent) => {
     this.pointers.delete(event.pointerId);
+    try {
+      this.els.scroll.releasePointerCapture(event.pointerId);
+    } catch {
+      /* not captured */
+    }
     if (this.mode === "pinch") {
       if (this.pointers.size < 2) {
         this.mode = "none";
         this.blockUntilUp = this.pointers.size > 0;
-        this.commitZoom();
+        this.els.stage.classList.remove("is-pinching");
+        // Defer commit so the last visual frame is not dropped on heavy HTML
+        window.clearTimeout(this.pinchRerenderTimer);
+        this.pinchRerenderTimer = window.setTimeout(() => {
+          if (this.mode === "pinch") return;
+          this.commitZoom();
+        }, 40);
       }
       return;
     }
@@ -2271,12 +2383,13 @@ export class Engine {
   private movePinch() {
     const pts = [...this.pointers.values()];
     if (pts.length < 2) return;
+    this.els.stage.classList.add("is-pinching");
     const dist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y) || 1;
     const mid = { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 };
     const next = clamp(this.pinchStartZoom * (dist / this.pinchDist), MIN_Z, MAX_Z);
     const scroll = this.els.scroll;
     const rect = scroll.getBoundingClientRect();
-    const oldR = this.visualRatio;
+    const oldR = this.visualRatio || 1;
     const ox = this.lastMid.x - rect.left;
     const oy = this.lastMid.y - rect.top;
     const layoutX = (scroll.scrollLeft + ox) / oldR;
