@@ -502,6 +502,9 @@ export class Engine {
   private mode: "none" | "draw" | "pan" | "pinch" | "media" | "laser" = "none";
   private pointers = new Map<number, Pt>();
   private blockUntilUp = false;
+  /** Desktop: click-hold converts draw/laser into pan */
+  private holdPanTimer = 0;
+  private holdPanAt: { x: number; y: number } | null = null;
   private pinchDist = 1;
   private pinchStartZoom = 1;
   private lastMid = { x: 0, y: 0 };
@@ -558,6 +561,7 @@ export class Engine {
     scroll.addEventListener("wheel", this.onWheel, { passive: false });
     scroll.addEventListener("scroll", this.onScroll, { passive: true });
     scroll.addEventListener("contextmenu", this.onContext);
+    scroll.addEventListener("pointerleave", this.onPointerLeave);
     scroll.addEventListener("gesturestart", this.blockGesture);
     scroll.addEventListener("gesturechange", this.blockGesture);
     window.addEventListener("keydown", this.onKey);
@@ -575,6 +579,7 @@ export class Engine {
     this.docGen++;
     this.stopMomentum();
     window.clearTimeout(this.pinchRerenderTimer);
+    this.clearHoldPan();
     this.clearDoc();
     const scroll = this.els.scroll;
     scroll.removeEventListener("pointerdown", this.onPointerDown, { capture: true });
@@ -585,6 +590,7 @@ export class Engine {
     scroll.removeEventListener("wheel", this.onWheel);
     scroll.removeEventListener("scroll", this.onScroll);
     scroll.removeEventListener("contextmenu", this.onContext);
+    scroll.removeEventListener("pointerleave", this.onPointerLeave);
     scroll.removeEventListener("gesturestart", this.blockGesture);
     scroll.removeEventListener("gesturechange", this.blockGesture);
     window.removeEventListener("keydown", this.onKey);
@@ -612,7 +618,31 @@ export class Engine {
       // Hand tool: allow taps into video / interactive HTML
       this.setHtmlPointerPass(true);
     }
+    // Desktop laser: hide system cursor; only the red laser dot is visible
+    this.applyToolCursor(tool);
+    if (tool !== "laser") this.hideLaser();
     this.syncHistory();
+  }
+
+  private applyToolCursor(tool: Tool) {
+    const scroll = this.els.scroll;
+    const fine = window.matchMedia("(pointer: fine)").matches;
+    if (tool === "laser" && fine) {
+      scroll.style.cursor = "none";
+      scroll.dataset.toolCursor = "laser";
+    } else if (tool === "pen" || tool === "highlighter") {
+      scroll.style.cursor = fine ? "crosshair" : "";
+      scroll.dataset.toolCursor = tool;
+    } else if (tool === "eraser" || tool === "scrub") {
+      scroll.style.cursor = fine ? "cell" : "";
+      scroll.dataset.toolCursor = tool;
+    } else if (tool === "text") {
+      scroll.style.cursor = fine ? "text" : "";
+      scroll.dataset.toolCursor = tool;
+    } else {
+      scroll.style.cursor = "";
+      delete scroll.dataset.toolCursor;
+    }
   }
 
   /** When false, HTML iframes ignore pointers so pen/text/shapes can draw on top. */
@@ -2024,7 +2054,11 @@ export class Engine {
   }
 
   private onPointerDown = (event: PointerEvent) => {
-    if (event.pointerType === "mouse" && event.button !== 0) return;
+    const toolNow = this.hooks.getPrefs().tool;
+    // Desktop laser: left OR right button (right-click points without OS menu)
+    if (event.pointerType === "mouse" && event.button !== 0) {
+      if (!(toolNow === "laser" && event.button === 2)) return;
+    }
     this.pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
     const capture = () => {
       try {
@@ -2118,6 +2152,7 @@ export class Engine {
     if (prefs.tool === "laser") {
       this.mode = "laser";
       this.moveLaser(event.clientX, event.clientY);
+      this.armHoldPan(event);
       event.preventDefault();
       capture();
       return;
@@ -2131,6 +2166,24 @@ export class Engine {
     }
     if (prefs.tool === "text") {
       event.preventDefault();
+      // Desktop hold → pan; short click → place text on pointer up via armed flag
+      if (event.pointerType === "mouse") {
+        this.armHoldPan(event);
+        // Defer text placement: if hold becomes pan, skip text
+        const x = event.clientX;
+        const y = event.clientY;
+        const p = page;
+        window.setTimeout(() => {
+          if (!this.alive || this.mode === "pan") return;
+          if (this.hooks.getPrefs().tool !== "text") return;
+          // Only place if still a simple click (no pan started)
+          if (this.mode !== "none" && this.mode !== "laser") return;
+          const point = this.toBase(p, x, y);
+          void this.addText(p, point);
+        }, 300);
+        capture();
+        return;
+      }
       const point = this.toBase(page, event.clientX, event.clientY);
       void this.addText(page, point);
       return;
@@ -2147,6 +2200,7 @@ export class Engine {
         obj: { type: "erase", points: [point], width },
       };
       this.mode = "draw";
+      this.armHoldPan(event);
       event.preventDefault();
       capture();
       return;
@@ -2156,10 +2210,11 @@ export class Engine {
       this.draft = {
         page,
         origin: this.toBase(page, event.clientX, event.clientY),
-        moved: true,
+        moved: false,
         obj: { type: "stroke", points: [], color: "#000", width: 1, opacity: 1 },
       };
       this.eraseAt(page, event.clientX, event.clientY);
+      this.armHoldPan(event);
       event.preventDefault();
       capture();
       return;
@@ -2167,6 +2222,8 @@ export class Engine {
     // Ensure HTML content cannot steal this stroke
     this.setHtmlPointerPass(false);
     this.beginShape(page, prefs.tool, event);
+    // Desktop: quick drag draws; click-and-hold pans the page
+    this.armHoldPan(event);
     event.preventDefault();
     capture();
   };
@@ -2199,6 +2256,15 @@ export class Engine {
     }
     if (this.mode === "laser") {
       this.moveLaser(event.clientX, event.clientY);
+      return;
+    }
+    // Desktop: laser follows mouse while the tool is selected (no need to hold click)
+    if (
+      event.pointerType === "mouse" &&
+      this.hooks.getPrefs().tool === "laser" &&
+      this.mode === "none"
+    ) {
+      this.moveLaser(event.clientX, event.clientY);
     }
   };
 
@@ -2226,10 +2292,14 @@ export class Engine {
     }
     if (this.pointers.size > 0) return;
     this.blockUntilUp = false;
+    this.clearHoldPan();
     if (this.mode === "pan") this.finishPan(event);
     else if (this.mode === "draw") this.finishDraw();
     else if (this.mode === "media") this.finishMedia();
-    else if (this.mode === "laser") this.hideLaser();
+    else if (this.mode === "laser") {
+      // Desktop: keep the laser visible after click; mobile: hide when finger lifts
+      if (event.pointerType !== "mouse") this.hideLaser();
+    }
     this.mode = "none";
   };
 
@@ -2280,7 +2350,14 @@ export class Engine {
   };
 
   private onContext = (event: Event) => {
+    // Hand: allow browser menu. Laser/pen: block menu so right-click can point.
     if (this.hooks.getPrefs().tool !== "hand") event.preventDefault();
+  };
+
+  private onPointerLeave = (event: PointerEvent) => {
+    if (event.pointerType === "mouse" && this.hooks.getPrefs().tool === "laser") {
+      this.hideLaser();
+    }
   };
 
   private blockGesture = (event: Event) => {
@@ -2310,7 +2387,60 @@ export class Engine {
     }
   };
 
+  private clearHoldPan() {
+    window.clearTimeout(this.holdPanTimer);
+    this.holdPanTimer = 0;
+    this.holdPanAt = null;
+  }
+
+  /** Desktop only: holding still ~280ms with a tool converts the gesture to pan. */
+  private armHoldPan(event: PointerEvent) {
+    if (event.pointerType !== "mouse") return;
+    this.clearHoldPan();
+    this.holdPanAt = { x: event.clientX, y: event.clientY };
+    this.holdPanTimer = window.setTimeout(() => {
+      const at = this.holdPanAt;
+      this.clearHoldPan();
+      if (!at || !this.alive) return;
+      const tool = this.hooks.getPrefs().tool;
+      if (tool === "hand") return;
+      // Only switch if the user has not started drawing / dragging
+      if (this.mode === "draw" && this.draft && !this.draft.moved) {
+        this.cancelDraft();
+        this.mode = "pan";
+        this.panX = at.x;
+        this.panY = at.y;
+        this.panT = performance.now();
+        this.panMoved = 0;
+        this.panVx = 0;
+        this.panVy = 0;
+        return;
+      }
+      if (this.mode === "laser") {
+        this.hideLaser();
+        this.mode = "pan";
+        this.panX = at.x;
+        this.panY = at.y;
+        this.panT = performance.now();
+        this.panMoved = 0;
+        this.panVx = 0;
+        this.panVy = 0;
+        return;
+      }
+      if (this.mode === "none" && tool !== "hand") {
+        this.mode = "pan";
+        this.panX = at.x;
+        this.panY = at.y;
+        this.panT = performance.now();
+        this.panMoved = 0;
+        this.panVx = 0;
+        this.panVy = 0;
+      }
+    }, 280);
+  }
+
   private beginPan(event: PointerEvent) {
+    this.clearHoldPan();
     this.mode = "pan";
     this.panX = event.clientX;
     this.panY = event.clientY;
@@ -2460,6 +2590,7 @@ export class Engine {
         this.draft.moved = Math.hypot(obj.w, obj.h) > 1.5;
       }
     }
+    if (this.draft.moved) this.clearHoldPan();
     this.schedulePaint(page);
   }
 
