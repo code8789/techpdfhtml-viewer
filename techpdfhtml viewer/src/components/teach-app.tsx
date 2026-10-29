@@ -106,6 +106,7 @@ export function TeachApp() {
   const engineRef = useRef<Engine | null>(null);
   const zoomRef = useRef<HTMLSpanElement>(null);
   const zoomLive = useRef(1);
+  const [zoomPct, setZoomPct] = useState(100);
   const fileRef = useRef<HTMLInputElement>(null);
   const dirRef = useRef<HTMLInputElement>(null);
   const mediaRef = useRef<HTMLInputElement>(null);
@@ -179,7 +180,9 @@ export function TeachApp() {
     },
     onZoom: (z: number) => {
       zoomLive.current = z;
-      if (zoomRef.current) zoomRef.current.textContent = `${Math.round(z * 100)}%`;
+      const pct = Math.round(z * 100);
+      if (zoomRef.current) zoomRef.current.textContent = `${pct}%`;
+      setZoomPct(pct);
     },
     requestText: (opts) =>
       new Promise((resolve) => {
@@ -632,6 +635,30 @@ export function TeachApp() {
               onClick={() => setThumbsOpen((open) => !open)}
             >
               <PagesIcon />
+            </button>
+            <button
+              type="button"
+              className="teach-tool"
+              aria-label="Zoom out"
+              onClick={() => engineRef.current?.zoomOut()}
+            >
+              <Minus size={18} />
+            </button>
+            <button
+              type="button"
+              className="teach-tool teach-tool-zoom"
+              aria-label="Fit width"
+              onClick={() => engineRef.current?.fit()}
+            >
+              <span className="dock-zoom-label">{zoomPct}%</span>
+            </button>
+            <button
+              type="button"
+              className="teach-tool"
+              aria-label="Zoom in"
+              onClick={() => engineRef.current?.zoomIn()}
+            >
+              <Plus size={18} />
             </button>
             <button
               type="button"
