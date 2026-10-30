@@ -524,6 +524,13 @@ export class Engine {
   /** Desktop: click-hold converts draw/laser into pan */
   private holdPanTimer = 0;
   private holdPanAt: { x: number; y: number } | null = null;
+  /** Hand tool on HTML: wait to see if user clicks (video) or drags (pan) */
+  private htmlHandPending: {
+    x: number;
+    y: number;
+    pointerId: number;
+    page: Page;
+  } | null = null;
   private pinchDist = 1;
   private pinchStartZoom = 1;
   private lastMid = { x: 0, y: 0 };
@@ -1426,10 +1433,10 @@ export class Engine {
     if (sw > layoutW + 48) page.baseW = Math.min(sw, 2400);
     else page.baseW = layoutW;
 
-    // Ensure interactive pages are tall enough that the sim is not clipped
-    const hasInteract = !!body.querySelector(".iframe-wrap, .live-frame, video");
-    const minH = hasInteract ? Math.max(480, interactH + 80) : 400;
-    page.baseH = Math.min(80000, Math.max(minH, Math.ceil(sh + 32)));
+    // Use real content height — do not pad hundreds of empty pixels between pages
+    const hasInteract = !!body.querySelector(".iframe-wrap, .live-frame, video, canvas");
+    const minH = hasInteract ? 320 : 200;
+    page.baseH = Math.min(80000, Math.max(minH, Math.ceil(sh + 16)));
     this.ensureTiles(page);
 
     // Size the iframe itself to fill the page so touches hit the content
@@ -1628,40 +1635,50 @@ export class Engine {
   }
 
   private applyChromeSpace() {
-    // One-line gap between pages — force with !important so global CSS cannot widen it
+    // Simple block stack: no flex gap (flex + CSS-scaled pages created huge empty bands).
+    // Only a small margin under each page shell (~one text line).
     const stage = this.els.stage;
-    stage.style.setProperty("display", "flex", "important");
-    stage.style.setProperty("flex-direction", "column", "important");
-    stage.style.setProperty("align-items", "center", "important");
-    stage.style.setProperty("padding", "8px", "important");
-    stage.style.setProperty("gap", "8px", "important");
-    stage.style.setProperty("row-gap", "8px", "important");
+    stage.style.setProperty("display", "block", "important");
+    stage.style.setProperty("padding", "4px", "important");
+    stage.style.setProperty("gap", "0", "important");
+    stage.style.setProperty("row-gap", "0", "important");
+    stage.style.setProperty("column-gap", "0", "important");
     for (const page of this.doc?.pages ?? []) {
-      page.shell.style.setProperty("margin", "0", "important");
-      page.shell.style.setProperty("margin-bottom", "0", "important");
+      page.shell.style.setProperty("display", "block", "important");
+      page.shell.style.setProperty("margin", "0 auto 8px auto", "important");
+      page.shell.style.setProperty("padding", "0", "important");
     }
   }
 
   private ensureGapStyle() {
-    if (document.getElementById("teachpdf-gap-fix")) return;
+    const old = document.getElementById("teachpdf-gap-fix");
+    if (old) old.remove();
+    const prev = document.getElementById("teachpdf-gap-fix-v2");
+    if (prev) prev.remove();
     const s = document.createElement("style");
-    s.id = "teachpdf-gap-fix";
+    s.id = "teachpdf-gap-fix-v2";
     s.textContent = `
-      .teach-stage, .teach-stage.stage, [class*="teach-stage"] {
-        gap: 8px !important;
-        row-gap: 8px !important;
-        padding: 8px !important;
+      .teach-stage {
+        display: block !important;
+        gap: 0 !important;
+        row-gap: 0 !important;
+        column-gap: 0 !important;
+        padding: 4px !important;
       }
       .page-shell {
-        margin: 0 !important;
-        margin-bottom: 0 !important;
+        display: block !important;
+        margin: 0 auto 8px auto !important;
+        padding: 0 !important;
       }
-      .dock-spacer { height: 4.5rem !important; }
+      .page-inner {
+        margin: 0 !important;
+        padding: 0 !important;
+      }
+      .tiles-host { pointer-events: none !important; }
       .media-item video, .html-frame video {
         pointer-events: auto !important;
         touch-action: manipulation !important;
       }
-      .tiles-host { pointer-events: none !important; }
     `;
     document.head.appendChild(s);
   }
@@ -2303,11 +2320,33 @@ export class Engine {
     }
 
     if (prefs.tool === "hand") {
+      // Always try video / tap-to-interact first (no capture)
       const interacted = this.tryInteractHtml(event.clientX, event.clientY);
-      if (interacted) {
-        // Do not preventDefault / capture — video controls need the real click
-        return;
+      if (interacted) return;
+
+      const page = this.pageAt(event.clientX, event.clientY);
+      // Over an HTML iframe: do NOT capture yet — a click must reach the video.
+      // If the pointer moves, we start pan in pointermove.
+      if (page?.iframe) {
+        const ir = page.iframe.getBoundingClientRect();
+        if (
+          event.clientX >= ir.left &&
+          event.clientX <= ir.right &&
+          event.clientY >= ir.top &&
+          event.clientY <= ir.bottom
+        ) {
+          this.htmlHandPending = {
+            x: event.clientX,
+            y: event.clientY,
+            pointerId: event.pointerId,
+            page,
+          };
+          // Do not preventDefault / setPointerCapture — allow the iframe click
+          return;
+        }
       }
+
+      this.htmlHandPending = null;
       this.beginPan(event);
       event.preventDefault();
       capture();
@@ -2398,6 +2437,31 @@ export class Engine {
       tracked.x = event.clientX;
       tracked.y = event.clientY;
     }
+    // Hand on HTML: convert to pan once the user actually drags
+    if (this.htmlHandPending && this.htmlHandPending.pointerId === event.pointerId) {
+      const dx = event.clientX - this.htmlHandPending.x;
+      const dy = event.clientY - this.htmlHandPending.y;
+      if (Math.hypot(dx, dy) > 8) {
+        const startX = this.htmlHandPending.x;
+        const startY = this.htmlHandPending.y;
+        this.htmlHandPending = null;
+        this.mode = "pan";
+        this.panX = startX;
+        this.panY = startY;
+        this.panT = performance.now();
+        this.panMoved = 0;
+        this.panVx = 0;
+        this.panVy = 0;
+        try {
+          this.els.scroll.setPointerCapture(event.pointerId);
+        } catch {
+          /* ignore */
+        }
+        event.preventDefault();
+        this.movePan(event);
+        return;
+      }
+    }
     if (this.mode === "pinch" && this.pointers.size >= 2) {
       event.preventDefault();
       this.movePinch();
@@ -2456,6 +2520,7 @@ export class Engine {
     }
     if (this.pointers.size > 0) return;
     this.blockUntilUp = false;
+    this.htmlHandPending = null;
     this.clearHoldPan();
     if (this.mode === "pan") this.finishPan(event);
     else if (this.mode === "draw") this.finishDraw();
@@ -2927,7 +2992,8 @@ export class Engine {
     for (const node of doc.querySelectorAll("video")) {
       if (!(node instanceof HTMLVideoElement)) continue;
       const r = node.getBoundingClientRect();
-      if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) return node;
+      // Include a few px under the box for the control bar on some browsers
+      if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom + 6) return node;
     }
     return null;
   }
