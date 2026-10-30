@@ -11,7 +11,7 @@ import {
 
 const TILE = 1800;
 const MIN_Z = 0.5;
-const MAX_Z = 20;
+const MAX_Z = 6;
 const HISTORY = 40;
 const DOCK_GAP = 92;
 const MAX_EDGE = 1536;
@@ -1579,9 +1579,9 @@ export class Engine {
     if (!this.doc) return;
     this.lastAvail = this.availableWidth();
     let S = this.displayScale();
-    if (this.doc.kind === "html" && Math.abs(S - 1) < 0.02) S = 1;
+    // Snap tiny floating error so 100% stays crystal-sharp (no CSS scale)
+    if (Math.abs(S - 1) < 0.02) S = 1;
     this.applyChromeSpace();
-    const isHtml = this.doc.kind === "html";
     for (const page of this.doc.pages) {
       const w = page.baseW * S;
       const h = page.baseH * S;
@@ -1589,45 +1589,28 @@ export class Engine {
       page.shell.style.height = `${h}px`;
       page.shell.style.marginLeft = "auto";
       page.shell.style.marginRight = "auto";
+      // Always keep inner at base pixel size; scale with transform when zoom ≠ 100%.
+      // At 100% transform is none → HTML canvas stays sharp.
+      page.inner.style.width = `${page.baseW}px`;
+      page.inner.style.height = `${page.baseH}px`;
       page.inner.style.transformOrigin = "0 0";
+      page.inner.style.transform = S === 1 ? "none" : `scale(${S})`;
       page.inner.style.setProperty("--page-scale", String(S));
-
-      if (isHtml) {
-        // SHARP path: size the iframe in real CSS pixels — never CSS-scale it.
-        // Scaling an iframe with transform makes canvas lessons look blurry.
-        page.inner.style.width = `${w}px`;
-        page.inner.style.height = `${h}px`;
-        page.inner.style.transform = "none";
-        if (page.iframe) {
-          page.iframe.style.width = "100%";
-          page.iframe.style.height = "100%";
-          page.iframe.style.transform = "none";
-          page.iframe.style.imageRendering = "auto";
-        }
-        // Ink + media stay in base coordinates and are scaled to the shell
-        if (page.tilesHost) {
-          page.tilesHost.style.position = "absolute";
-          page.tilesHost.style.left = "0";
-          page.tilesHost.style.top = "0";
-          page.tilesHost.style.width = `${page.baseW}px`;
-          page.tilesHost.style.height = `${page.baseH}px`;
-          page.tilesHost.style.transformOrigin = "0 0";
-          page.tilesHost.style.transform = S === 1 ? "none" : `scale(${S})`;
-          page.tilesHost.style.pointerEvents = "none";
-        }
-        if (page.mediaLayer) {
-          page.mediaLayer.style.position = "absolute";
-          page.mediaLayer.style.left = "0";
-          page.mediaLayer.style.top = "0";
-          page.mediaLayer.style.width = `${page.baseW}px`;
-          page.mediaLayer.style.height = `${page.baseH}px`;
-          page.mediaLayer.style.transformOrigin = "0 0";
-          page.mediaLayer.style.transform = S === 1 ? "none" : `scale(${S})`;
-        }
-      } else {
-        page.inner.style.width = `${page.baseW}px`;
-        page.inner.style.height = `${page.baseH}px`;
-        page.inner.style.transform = S === 1 ? "none" : `scale(${S})`;
+      if (page.iframe) {
+        page.iframe.style.width = "100%";
+        page.iframe.style.height = "100%";
+        page.iframe.style.transform = "none";
+      }
+      // Reset any one-off ink/media transforms from older builds
+      if (page.tilesHost) {
+        page.tilesHost.style.transform = "";
+        page.tilesHost.style.width = "";
+        page.tilesHost.style.height = "";
+      }
+      if (page.mediaLayer) {
+        page.mediaLayer.style.transform = "";
+        page.mediaLayer.style.width = "";
+        page.mediaLayer.style.height = "";
       }
     }
     if (Math.abs(this.visualRatio - 1) < 0.001) {
@@ -1635,17 +1618,6 @@ export class Engine {
       this.els.sizer.style.width = "";
       this.els.sizer.style.height = "";
       this.els.sizer.style.minWidth = "";
-    }
-    // Let canvas lessons re-allocate their backing store at the new pixel size
-    if (this.doc.kind === "html" && this.mode !== "pinch") {
-      for (const page of this.doc.pages) {
-        if (!page.iframe?.contentWindow) continue;
-        try {
-          page.iframe.contentWindow.dispatchEvent(new Event("resize"));
-        } catch {
-          /* ignore */
-        }
-      }
     }
   }
 
@@ -1691,7 +1663,7 @@ export class Engine {
   private zoomAt(next: number, clientX: number, clientY: number) {
     if (!this.doc) return;
     next = clamp(next, MIN_Z, MAX_Z);
-    const old = this.committedZoom;
+    const old = Math.max(0.05, this.committedZoom);
     if (Math.abs(next - old) < 0.001) {
       this.hooks.onZoom(this.userZoom);
       return;
@@ -1706,9 +1678,15 @@ export class Engine {
     this.userZoom = next;
     this.committedZoom = next;
     this.visualRatio = 1;
-    this.layout();
-    scroll.scrollLeft = layoutX * applied - ox;
-    scroll.scrollTop = layoutY * applied - oy;
+    this.els.stage.style.transform = "";
+    this.els.stage.classList.remove("is-pinching");
+    try {
+      this.layout();
+      scroll.scrollLeft = Math.max(0, layoutX * applied - ox);
+      scroll.scrollTop = Math.max(0, layoutY * applied - oy);
+    } catch {
+      /* ignore layout errors */
+    }
     this.mountVisible(true);
     this.hooks.onZoom(next);
     this.patch({ zoom: next });
@@ -1717,38 +1695,27 @@ export class Engine {
 
   private commitZoom() {
     if (!this.doc) return;
-    const R = this.visualRatio;
+    const R = this.visualRatio || 1;
     if (Math.abs(this.userZoom - this.committedZoom) < 0.001 && Math.abs(R - 1) < 0.001) return;
     const scroll = this.els.scroll;
     const rect = scroll.getBoundingClientRect();
     const ox = rect.width / 2;
     const oy = rect.height / 2;
-    const layoutX = (scroll.scrollLeft + ox) / R;
-    const layoutY = (scroll.scrollTop + oy) / R;
-    const applied = this.userZoom / this.committedZoom;
+    const safeR = Math.max(0.05, R);
+    const layoutX = (scroll.scrollLeft + ox) / safeR;
+    const layoutY = (scroll.scrollTop + oy) / safeR;
+    const applied = this.userZoom / Math.max(0.05, this.committedZoom);
     this.committedZoom = this.userZoom;
     this.visualRatio = 1;
-
-    // HTML: prefer scale ≈ 1 by widening the page layout instead of CSS-upscaling
-    if (this.doc.kind === "html" && Math.abs(this.committedZoom - 1) > 0.02) {
-      const targetW = Math.max(280, Math.min(2400, this.availableWidth() * this.committedZoom));
-      for (const page of this.doc.pages) {
-        if (page.iframe?.contentDocument?.body) {
-          this.measureHtml(page, targetW);
-        } else {
-          page.baseW = targetW;
-          page.baseH = Math.round(targetW * (page.baseH / Math.max(1, page.baseW)));
-          this.ensureTiles(page);
-        }
-      }
-      this.userZoom = 1;
-      this.committedZoom = 1;
-    }
-
-    this.layout();
-    scroll.scrollLeft = layoutX * applied - ox;
-    scroll.scrollTop = layoutY * applied - oy;
     this.els.stage.classList.remove("is-pinching");
+    this.els.stage.style.transform = "";
+    try {
+      this.layout();
+      scroll.scrollLeft = Math.max(0, layoutX * applied - ox);
+      scroll.scrollTop = Math.max(0, layoutY * applied - oy);
+    } catch {
+      /* keep UI alive if a page layout throws */
+    }
     this.mountVisible(true);
     this.hooks.onZoom(this.userZoom);
     this.patch({ zoom: this.userZoom });
