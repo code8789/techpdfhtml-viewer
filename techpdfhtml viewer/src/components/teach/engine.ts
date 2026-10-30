@@ -142,8 +142,10 @@ type Draft = { page: Page; obj: DrawObj; origin: Pt; moved: boolean };
 
 const MOBILE_FIX = `<meta name="viewport" content="width=device-width, initial-scale=1">
 <style id="teachpdf-view-fix">
-html,body{margin:0;background:#fff;height:auto!important;min-height:100%;overflow:visible!important;touch-action:auto!important;}
-img,video,svg,canvas{max-width:100%;height:auto;}
+html,body{margin:0;height:auto!important;min-height:100%;overflow:visible!important;touch-action:auto!important;}
+/* Images/video fluid — but NOT canvas (interactive sims need crisp pixel sizing) */
+img,video,svg{max-width:100%;height:auto;}
+canvas{max-width:none;image-rendering:auto;}
 video{
   background:#000;
   touch-action:manipulation!important;
@@ -159,43 +161,46 @@ video{
   touch-action:auto!important;
   pointer-events:auto!important;
 }
-.iframe-wrap{
-  width:100%!important;
-  max-width:100%!important;
-  height:auto!important;
-  min-height:280px!important;
-  aspect-ratio:1 / 1.05;
-  margin:0 auto!important;
-}
-.live-frame, .iframe-wrap > iframe{
-  width:100%!important;
-  height:100%!important;
-  min-height:280px!important;
-  border:0!important;
-  display:block!important;
-}
-.page video, video{
-  width:100%!important;
-  max-width:100%!important;
-  height:auto!important;
-  max-height:none!important;
-  display:block!important;
-  margin:0 auto!important;
-}
-.page img{
-  max-width:100%!important;
-  height:auto!important;
-  max-height:none!important;
-}
-.page{
-  padding:10px!important;
-  min-height:auto!important;
-}
 .tap-to-play{
   touch-action:manipulation!important;
   pointer-events:auto!important;
   cursor:pointer;
   z-index:10!important;
+}
+/* Mobile-only layout helpers — do not blunt desktop HD canvas lessons */
+@media (max-width: 760px) {
+  .iframe-wrap{
+    width:100%!important;
+    max-width:100%!important;
+    height:auto!important;
+    min-height:280px!important;
+    aspect-ratio:1 / 1.05;
+    margin:0 auto!important;
+  }
+  .live-frame, .iframe-wrap > iframe{
+    width:100%!important;
+    height:100%!important;
+    min-height:280px!important;
+    border:0!important;
+    display:block!important;
+  }
+  .page video, video{
+    width:100%!important;
+    max-width:100%!important;
+    height:auto!important;
+    max-height:none!important;
+    display:block!important;
+    margin:0 auto!important;
+  }
+  .page img{
+    max-width:100%!important;
+    height:auto!important;
+    max-height:none!important;
+  }
+  .page{
+    padding:10px!important;
+    min-height:auto!important;
+  }
 }
 </style>
 <script id="teachpdf-media-fix">
@@ -770,7 +775,13 @@ export class Engine {
     this.visualRatio = 1;
     const docs = splitHtmlDocuments(source);
     // Free the giant source string from the open path ASAP after split
-    const layoutW = Math.max(280, Math.min(960, this.availableWidth()));
+    // Desktop: match page width to the viewport so CSS scale stays ~1 (sharp canvas).
+    // Mobile: keep a sensible min width.
+    const avail = this.availableWidth();
+    const fine = typeof window !== "undefined" && window.matchMedia("(pointer: fine)").matches;
+    const layoutW = fine
+      ? Math.max(480, Math.min(1600, avail))
+      : Math.max(280, Math.min(960, avail));
     const pages: Page[] = [];
     for (let i = 0; i < docs.length; i++) {
       const page = this.makePage(i + 1, layoutW, Math.round(layoutW * 1.25));
@@ -1283,32 +1294,42 @@ export class Engine {
     }
     const body = doc.body;
     const root = doc.documentElement;
+    const fine =
+      typeof window !== "undefined" && window.matchMedia("(pointer: fine)").matches;
+    const narrow = layoutW < 760;
 
-    // Mobile: give interactive blocks nearly full page width and a tall
-    // nearly-square height so CRT / atom sims are not squashed.
     const contentW = Math.max(260, layoutW - 24);
-    // Prefer ~1:1 up to ~1.15 height ratio; floor so small phones still usable
     const interactH = Math.round(
       Math.min(720, Math.max(contentW * 1.05, Math.min(contentW * 1.2, 560))),
     );
 
-    for (const wrap of body.querySelectorAll(".iframe-wrap")) {
-      if (!(wrap instanceof HTMLElement)) continue;
-      wrap.style.boxSizing = "border-box";
-      wrap.style.width = "100%";
-      wrap.style.maxWidth = "100%";
-      wrap.style.height = `${interactH}px`;
-      wrap.style.minHeight = `${interactH}px`;
-      wrap.style.maxHeight = "none";
-      wrap.style.margin = "0 auto";
-      wrap.style.overflow = "hidden";
-      for (const frame of wrap.querySelectorAll("iframe, .live-frame")) {
-        if (!(frame instanceof HTMLElement)) continue;
-        frame.style.width = "100%";
-        frame.style.height = "100%";
-        frame.style.minHeight = `${interactH}px`;
-        frame.style.border = "0";
-        frame.style.display = "block";
+    // Only force interactive wrapper sizes on small / touch layouts.
+    // Desktop HD lessons (canvas sims) keep their own CSS.
+    if (!fine || narrow) {
+      for (const wrap of body.querySelectorAll(".iframe-wrap")) {
+        if (!(wrap instanceof HTMLElement)) continue;
+        wrap.style.boxSizing = "border-box";
+        wrap.style.width = "100%";
+        wrap.style.maxWidth = "100%";
+        wrap.style.height = `${interactH}px`;
+        wrap.style.minHeight = `${interactH}px`;
+        wrap.style.maxHeight = "none";
+        wrap.style.margin = "0 auto";
+        wrap.style.overflow = "hidden";
+        for (const frame of wrap.querySelectorAll("iframe, .live-frame")) {
+          if (!(frame instanceof HTMLElement)) continue;
+          frame.style.width = "100%";
+          frame.style.height = "100%";
+          frame.style.minHeight = `${interactH}px`;
+          frame.style.border = "0";
+          frame.style.display = "block";
+        }
+      }
+
+      for (const pageEl of body.querySelectorAll(".page, section.page")) {
+        if (!(pageEl instanceof HTMLElement)) continue;
+        pageEl.style.minHeight = "auto";
+        pageEl.style.padding = "10px";
       }
     }
 
@@ -1324,13 +1345,12 @@ export class Engine {
       vid.controls = true;
       vid.setAttribute("playsinline", "");
       vid.setAttribute("webkit-playsinline", "");
-      // If metadata known, reserve space so layout does not jump/compress
       if (vid.videoWidth > 0 && vid.videoHeight > 0) {
         const ratio = vid.videoHeight / vid.videoWidth;
         vid.style.aspectRatio = `${vid.videoWidth} / ${vid.videoHeight}`;
         const ideal = Math.round(contentW * ratio);
         if (ideal > 120) vid.style.minHeight = `${Math.min(ideal, 720)}px`;
-      } else {
+      } else if (!fine || narrow) {
         vid.style.minHeight = `${Math.round(contentW * 0.56)}px`;
       }
     }
@@ -1342,11 +1362,15 @@ export class Engine {
       img.style.maxHeight = "none";
     }
 
-    // Page chrome from the lesson HTML — reduce padding that steals height
-    for (const pageEl of body.querySelectorAll(".page, section.page")) {
-      if (!(pageEl instanceof HTMLElement)) continue;
-      pageEl.style.minHeight = "auto";
-      pageEl.style.padding = "10px";
+    // Canvas scenes: ensure they fill their container crisply on desktop
+    for (const canvas of body.querySelectorAll("canvas")) {
+      if (!(canvas instanceof HTMLCanvasElement)) continue;
+      const parent = canvas.parentElement;
+      if (parent instanceof HTMLElement) {
+        // Prefer container-driven size (solar system .scene)
+        if (!canvas.style.width) canvas.style.width = "100%";
+        if (!canvas.style.height) canvas.style.height = "100%";
+      }
     }
 
     void body.offsetHeight;
@@ -1402,6 +1426,12 @@ export class Engine {
       page.iframe.style.height = "100%";
       page.iframe.style.border = "0";
       page.iframe.style.touchAction = "auto";
+      // Ask the lesson to re-measure (canvas resize / HD redraw)
+      try {
+        page.iframe.contentWindow?.dispatchEvent(new Event("resize"));
+      } catch {
+        /* ignore */
+      }
     }
   }
 
@@ -1534,16 +1564,22 @@ export class Engine {
   private layout() {
     if (!this.doc) return;
     this.lastAvail = this.availableWidth();
-    const S = this.displayScale();
+    let S = this.displayScale();
+    // Avoid blurry HTML canvases from fractional CSS scale when nearly 1:1
+    if (this.doc.kind === "html" && Math.abs(S - 1) < 0.03) S = 1;
     this.applyChromeSpace();
     for (const page of this.doc.pages) {
       const w = page.baseW * S;
       const h = page.baseH * S;
       page.shell.style.width = `${w}px`;
       page.shell.style.height = `${h}px`;
+      // Center the page shell in the stage
+      page.shell.style.marginLeft = "auto";
+      page.shell.style.marginRight = "auto";
       page.inner.style.width = `${page.baseW}px`;
       page.inner.style.height = `${page.baseH}px`;
-      page.inner.style.transform = `scale(${S})`;
+      page.inner.style.transformOrigin = "0 0";
+      page.inner.style.transform = S === 1 ? "none" : `scale(${S})`;
       page.inner.style.setProperty("--page-scale", String(S));
     }
     if (Math.abs(this.visualRatio - 1) < 0.001) {
