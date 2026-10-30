@@ -571,6 +571,7 @@ export class Engine {
     this.laser = document.createElement("div");
     this.laser.className = "laser-dot";
     document.body.appendChild(this.laser);
+    this.ensureGapStyle();
     const scroll = els.scroll;
     scroll.addEventListener("pointerdown", this.onPointerDown, { capture: true });
     scroll.addEventListener("pointermove", this.onPointerMove, { capture: true });
@@ -1609,11 +1610,13 @@ export class Engine {
         page.tilesHost.style.transform = "";
         page.tilesHost.style.width = "";
         page.tilesHost.style.height = "";
+        page.tilesHost.style.pointerEvents = "none";
       }
       if (page.mediaLayer) {
         page.mediaLayer.style.transform = "";
         page.mediaLayer.style.width = "";
         page.mediaLayer.style.height = "";
+        page.mediaLayer.style.pointerEvents = "auto";
       }
     }
     if (Math.abs(this.visualRatio - 1) < 0.001) {
@@ -1625,11 +1628,42 @@ export class Engine {
   }
 
   private applyChromeSpace() {
-    // Tight page gap (~one text line). Never divide by visualRatio
-    // (that produced huge gaps when zoom state was fractional).
-    const pad = 6;
-    this.els.stage.style.padding = `${pad}px`;
-    this.els.stage.style.gap = `${pad}px`;
+    // One-line gap between pages — force with !important so global CSS cannot widen it
+    const stage = this.els.stage;
+    stage.style.setProperty("display", "flex", "important");
+    stage.style.setProperty("flex-direction", "column", "important");
+    stage.style.setProperty("align-items", "center", "important");
+    stage.style.setProperty("padding", "8px", "important");
+    stage.style.setProperty("gap", "8px", "important");
+    stage.style.setProperty("row-gap", "8px", "important");
+    for (const page of this.doc?.pages ?? []) {
+      page.shell.style.setProperty("margin", "0", "important");
+      page.shell.style.setProperty("margin-bottom", "0", "important");
+    }
+  }
+
+  private ensureGapStyle() {
+    if (document.getElementById("teachpdf-gap-fix")) return;
+    const s = document.createElement("style");
+    s.id = "teachpdf-gap-fix";
+    s.textContent = `
+      .teach-stage, .teach-stage.stage, [class*="teach-stage"] {
+        gap: 8px !important;
+        row-gap: 8px !important;
+        padding: 8px !important;
+      }
+      .page-shell {
+        margin: 0 !important;
+        margin-bottom: 0 !important;
+      }
+      .dock-spacer { height: 4.5rem !important; }
+      .media-item video, .html-frame video {
+        pointer-events: auto !important;
+        touch-action: manipulation !important;
+      }
+      .tiles-host { pointer-events: none !important; }
+    `;
+    document.head.appendChild(s);
   }
 
   private applyTransform() {
@@ -2271,6 +2305,7 @@ export class Engine {
     if (prefs.tool === "hand") {
       const interacted = this.tryInteractHtml(event.clientX, event.clientY);
       if (interacted) {
+        // Do not preventDefault / capture — video controls need the real click
         return;
       }
       this.beginPan(event);
@@ -2887,6 +2922,50 @@ export class Engine {
     this.laser.style.display = "none";
   }
 
+  /** Hit-test videos by viewport box (works with native control bar on desktop). */
+  private videoAtPoint(doc: Document, x: number, y: number): HTMLVideoElement | null {
+    for (const node of doc.querySelectorAll("video")) {
+      if (!(node instanceof HTMLVideoElement)) continue;
+      const r = node.getBoundingClientRect();
+      if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) return node;
+    }
+    return null;
+  }
+
+  private unlockVideo(video: HTMLVideoElement, iframe?: HTMLIFrameElement | null) {
+    video.setAttribute("playsinline", "");
+    video.setAttribute("webkit-playsinline", "");
+    video.setAttribute("controls", "true");
+    video.controls = true;
+    video.style.pointerEvents = "auto";
+    video.style.touchAction = "manipulation";
+    if (iframe) {
+      iframe.style.pointerEvents = "auto";
+      iframe.style.touchAction = "auto";
+      iframe.classList.add("is-live");
+    }
+    this.videoFocus = true;
+    this.patch({ video: true });
+    try {
+      video.focus({ preventScroll: true });
+    } catch {
+      try {
+        video.focus();
+      } catch {
+        /* ignore */
+      }
+    }
+    if (video.paused) {
+      void video.play().catch(() => {
+        /* controls still available */
+      });
+      this.say("Playing – click controls to pause");
+    } else {
+      video.pause();
+      this.say("Paused");
+    }
+  }
+
   /** Returns true if the touch should be left for the HTML content (no pan/capture). */
   private tryInteractHtml(x: number, y: number): boolean {
     const page = this.pageAt(x, y);
@@ -2896,6 +2975,14 @@ export class Engine {
 
     const rect = iframe.getBoundingClientRect();
     if (rect.width < 2 || rect.height < 2) return false;
+    if (x < rect.left || x > rect.right || y < rect.top || y > rect.bottom) return false;
+
+    // Prefer geometry hit-test so native video control bar clicks work on desktop
+    const byBox = this.videoAtPoint(doc, x, y);
+    if (byBox) {
+      this.unlockVideo(byBox, iframe);
+      return true;
+    }
 
     const ix = ((x - rect.left) / rect.width) * iframe.clientWidth;
     const iy = ((y - rect.top) / rect.height) * iframe.clientHeight;
@@ -2906,55 +2993,21 @@ export class Engine {
     } catch {
       return false;
     }
-    if (!el) return false;
+    if (!el) {
+      // Over iframe but no element — still don't steal if video focus
+      return this.videoFocus;
+    }
 
-    // While video is focused, only pass through when the finger is still on a video
     if (this.videoFocus) {
-      if (el.closest("video")) return true;
-      // Tapped outside the video → exit video mode so pan works again
+      if (el.closest("video") || this.videoAtPoint(doc, x, y)) return true;
       this.clearVideoFocus();
       return false;
     }
 
-    // 1. Real <video>
+    // 1. Real <video> via DOM walk
     const video = el.closest("video");
     if (video instanceof HTMLVideoElement) {
-      video.setAttribute("playsinline", "");
-      video.setAttribute("webkit-playsinline", "");
-      video.setAttribute("controls", "true");
-      video.controls = true;
-      video.style.pointerEvents = "auto";
-      video.style.touchAction = "manipulation";
-      video.style.maxWidth = "100%";
-      video.style.width = "100%";
-      video.style.height = "auto";
-
-      iframe.style.pointerEvents = "auto";
-      iframe.style.touchAction = "auto";
-      iframe.classList.add("is-live");
-
-      this.videoFocus = true;
-      this.patch({ video: true });
-
-      try {
-        video.focus({ preventScroll: true });
-      } catch {
-        try {
-          video.focus();
-        } catch {
-          /* ignore */
-        }
-      }
-      // Start/stop under this user gesture so mobile browsers allow playback
-      if (video.paused) {
-        void video.play().catch(() => {
-          /* controls still available */
-        });
-        this.say("Playing – use controls to pause");
-      } else {
-        video.pause();
-        this.say("Paused");
-      }
+      this.unlockVideo(video, iframe);
       return true;
     }
 
