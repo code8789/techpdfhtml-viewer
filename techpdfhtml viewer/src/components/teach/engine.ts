@@ -121,6 +121,8 @@ type Page = {
   thumbBtn?: HTMLButtonElement;
   pdfNumber: number | null;
   paper: string | null;
+  lastBodyH?: number;
+  roT?: number;
 };
 
 type Doc = {
@@ -517,6 +519,8 @@ export class Engine {
   private ownedUrls: string[] = [];
   private urlFiles = new Map<string, Blob>();
   private htmlObserver: ResizeObserver | null = null;
+  private htmlBodies = new Map<Element, Page>();
+  private htmlLayoutW = 0;
   private resizeObserver: ResizeObserver;
   private lastAvail = 0;
   private resizeT = 0;
@@ -806,6 +810,7 @@ export class Engine {
     const layoutW = fine
       ? Math.max(480, Math.min(1600, avail))
       : Math.max(280, Math.min(960, avail));
+    this.htmlLayoutW = layoutW;
     const pages: Page[] = [];
     for (let i = 0; i < docs.length; i++) {
       const page = this.makePage(i + 1, layoutW, Math.round(layoutW * 1.25));
@@ -1400,16 +1405,19 @@ export class Engine {
       }
     }
 
-    // Shrink the frame while measuring. Otherwise scrollHeight is never smaller
+    // Measure inside a normal screen-sized viewport (not tiny, not the stale
+    // placeholder) so 100%/vh based sections neither collapse nor stay huge.
+    const viewH = Math.round(clamp(layoutW * 0.56, 360, 760));
+    // (old note) Shrink the frame while measuring. Otherwise scrollHeight is never smaller
     // than the frame's own (placeholder) height, which caused the huge page gaps.
     if (page.iframe) {
       page.iframe.style.position = "absolute";
-      page.iframe.style.height = "8px";
+      page.iframe.style.height = `${viewH}px`;
     }
     void body.offsetHeight;
 
     const sw = Math.max(root.scrollWidth, body.scrollWidth, layoutW);
-    let sh = Math.max(root.scrollHeight, body.scrollHeight, 8);
+    let sh = Math.max(body.scrollHeight, Math.ceil(body.getBoundingClientRect().height), 8);
 
     let stack = 0;
     for (const el of body.querySelectorAll("img,video,canvas,svg,iframe,.iframe-wrap,.page")) {
@@ -1443,7 +1451,7 @@ export class Engine {
 
     // Use real content height — do not pad hundreds of empty pixels between pages
     const hasInteract = !!body.querySelector(".iframe-wrap, .live-frame, video, canvas");
-    const minH = hasInteract ? 120 : 24;
+    const minH = hasInteract ? 240 : 24;
     page.baseH = Math.min(80000, Math.max(minH, Math.ceil(sh + 16)));
     this.ensureTiles(page);
 
@@ -1456,6 +1464,8 @@ export class Engine {
       page.iframe.style.height = "100%";
       page.iframe.style.border = "0";
       page.iframe.style.touchAction = "auto";
+      void body.offsetHeight;
+      page.lastBodyH = body.scrollHeight;
       // Ask the lesson to re-measure (canvas resize / HD redraw)
       try {
         page.iframe.contentWindow?.dispatchEvent(new Event("resize"));
@@ -1466,33 +1476,40 @@ export class Engine {
   }
 
   private watchHtml() {
-    this.htmlObserver?.disconnect();
     if (this.doc?.kind !== "html") return;
-    this.htmlObserver = new ResizeObserver(() => {
-      if (this.doc?.kind !== "html") return;
-      // Never reflow while pinching — this was freezing zoom on large HTML
-      if (this.mode === "pinch") return;
-      let grew = false;
-      for (const page of this.doc.pages) {
-        const doc = page.iframe?.contentDocument;
-        if (!doc) continue;
-        const sh = Math.max(doc.documentElement.scrollHeight, doc.body?.scrollHeight ?? 0);
-        const next = Math.min(80000, Math.max(page.baseH, sh));
-        if (next > page.baseH + 24) {
-          page.baseH = next;
-          this.ensureTiles(page);
-          grew = true;
+    for (const page of this.doc.pages) this.observeHtmlPage(page);
+  }
+
+  private observeHtmlPage(page: Page) {
+    const body = page.iframe?.contentDocument?.body;
+    if (!body || this.htmlBodies.get(body) === page) return;
+    if (!this.htmlObserver) {
+      this.htmlObserver = new ResizeObserver((entries) => {
+        for (const entry of entries) {
+          const pg = this.htmlBodies.get(entry.target);
+          if (!pg) continue;
+          window.clearTimeout(pg.roT);
+          pg.roT = window.setTimeout(() => this.remeasureHtml(pg), 120);
         }
-      }
-      if (grew) {
-        this.layout();
-        this.mountVisible(false);
-      }
-    });
-    for (const page of this.doc.pages) {
-      const body = page.iframe?.contentDocument?.body;
-      if (body) this.htmlObserver.observe(body);
+      });
     }
+    this.htmlBodies.set(body, page);
+    this.htmlObserver.observe(body);
+  }
+
+  /** Content finished loading (images, video metadata, canvas) — fix the page height. */
+  private remeasureHtml(page: Page) {
+    if (!this.alive || this.doc?.kind !== "html" || !this.doc.pages.includes(page)) return;
+    if (this.mode === "pinch") {
+      page.roT = window.setTimeout(() => this.remeasureHtml(page), 300);
+      return;
+    }
+    const body = page.iframe?.contentDocument?.body;
+    if (!body) return;
+    if (Math.abs(body.scrollHeight - (page.lastBodyH ?? -99)) <= 3) return;
+    this.measureHtml(page, this.htmlLayoutW || page.baseW);
+    this.layout();
+    this.mountVisible(false);
   }
 
   private makePage(index: number, baseW: number, baseH: number) {
@@ -1568,6 +1585,7 @@ export class Engine {
     this.thumbToken++;
     this.htmlObserver?.disconnect();
     this.htmlObserver = null;
+    this.htmlBodies.clear();
     this.clearVideoFocus();
     this.selectedMediaId = null;
     try {
@@ -1821,7 +1839,8 @@ export class Engine {
         void waitForFrame(iframe, 1500).then(() => {
           if (!this.alive || !page.shell.isConnected) return;
           if (this.mode === "pinch") return;
-          this.measureHtml(page, page.baseW || this.availableWidth());
+          this.measureHtml(page, this.htmlLayoutW || page.baseW || this.availableWidth());
+          this.observeHtmlPage(page);
           this.layout();
         });
       }
