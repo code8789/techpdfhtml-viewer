@@ -1492,6 +1492,9 @@ export class Engine {
     mediaLayer.className = "media-layer";
     const tilesHost = document.createElement("div");
     tilesHost.className = "tiles-host";
+    // Ink must not block video controls / HTML hits underneath
+    tilesHost.style.pointerEvents = "none";
+    mediaLayer.style.pointerEvents = "auto";
     inner.append(fill, mediaLayer, tilesHost);
     shell.appendChild(inner);
     this.els.stage.appendChild(shell);
@@ -1622,7 +1625,9 @@ export class Engine {
   }
 
   private applyChromeSpace() {
-    const pad = 12 / this.visualRatio;
+    // Tight page gap (~one text line). Never divide by visualRatio
+    // (that produced huge gaps when zoom state was fractional).
+    const pad = 6;
     this.els.stage.style.padding = `${pad}px`;
     this.els.stage.style.gap = `${pad}px`;
   }
@@ -2049,7 +2054,14 @@ export class Engine {
       video.controls = true;
       video.playsInline = true;
       video.setAttribute("playsinline", "");
+      video.setAttribute("webkit-playsinline", "");
+      video.setAttribute("controls", "true");
       video.preload = "metadata";
+      video.style.width = "100%";
+      video.style.height = "100%";
+      video.style.objectFit = "contain";
+      video.style.pointerEvents = "auto";
+      video.style.touchAction = "manipulation";
       el.appendChild(video);
     } else {
       const img = document.createElement("img");
@@ -2199,6 +2211,48 @@ export class Engine {
       capture();
       return;
     }
+    // Selected media handles (resize/rotate) always drag
+    if (hit && hit.mode && hit.isHandle && this.selectedMediaId === hit.media.id) {
+      this.beginMedia(hit, event, hit.mode);
+      event.preventDefault();
+      capture();
+      return;
+    }
+
+    // Hand + video media: unlock native controls (don't start drag)
+    if (hit && prefs.tool === "hand" && hit.media.kind === "video") {
+      const video = hit.el.querySelector("video");
+      if (video instanceof HTMLVideoElement) {
+        video.controls = true;
+        video.setAttribute("playsinline", "");
+        video.setAttribute("webkit-playsinline", "");
+        video.style.pointerEvents = "auto";
+        video.style.touchAction = "manipulation";
+        this.videoFocus = true;
+        this.patch({ video: true });
+        try {
+          video.focus({ preventScroll: true });
+        } catch {
+          try {
+            video.focus();
+          } catch {
+            /* ignore */
+          }
+        }
+        // Toggle play on this user gesture (required on mobile)
+        if (video.paused) {
+          void video.play().catch(() => {
+            /* user can use controls */
+          });
+        } else {
+          video.pause();
+        }
+        this.say("Video ready – use the controls");
+        // Do not capture — let controls receive later taps
+        return;
+      }
+    }
+
     if (hit && hit.mode === "move" && (prefs.tool === "hand" || this.selectedMediaId === hit.media.id)) {
       this.selectMedia(hit.media.id);
       this.beginMedia(hit, event, "move");
@@ -2215,12 +2269,8 @@ export class Engine {
     }
 
     if (prefs.tool === "hand") {
-      // Prefer letting video controls and interactive HTML receive the touch.
-      // Only start a pan when the touch is clearly on empty page chrome.
       const interacted = this.tryInteractHtml(event.clientX, event.clientY);
       if (interacted) {
-        // Do not preventDefault / setPointerCapture – the browser must
-        // deliver this gesture to the <video> or nested interactive page.
         return;
       }
       this.beginPan(event);
@@ -2879,16 +2929,13 @@ export class Engine {
       video.style.width = "100%";
       video.style.height = "auto";
 
-      // Make sure nothing in our page shell sits above the video
       iframe.style.pointerEvents = "auto";
       iframe.style.touchAction = "auto";
       iframe.classList.add("is-live");
 
       this.videoFocus = true;
       this.patch({ video: true });
-      this.say("Video ready – use the controls");
 
-      // Focus so mobile browsers treat later taps as media gestures
       try {
         video.focus({ preventScroll: true });
       } catch {
@@ -2897,6 +2944,16 @@ export class Engine {
         } catch {
           /* ignore */
         }
+      }
+      // Start/stop under this user gesture so mobile browsers allow playback
+      if (video.paused) {
+        void video.play().catch(() => {
+          /* controls still available */
+        });
+        this.say("Playing – use controls to pause");
+      } else {
+        video.pause();
+        this.say("Paused");
       }
       return true;
     }
