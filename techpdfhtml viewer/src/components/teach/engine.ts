@@ -140,11 +140,6 @@ type MediaHit = {
 
 type Draft = { page: Page; obj: DrawObj; origin: Pt; moved: boolean };
 
-/**
- * FIXED:
- * 1. Zero/one-line gap between pages enforced through CSS and wrapper layout.
- * 2. Video element attributes & script fix for touch/playback interruption.
- */
 const MOBILE_FIX = `<meta name="viewport" content="width=device-width, initial-scale=1">
 <style id="teachpdf-view-fix">
 html,body{margin:0!important;padding:0!important;height:auto!important;min-height:100%;overflow:visible!important;touch-action:auto!important;}
@@ -333,6 +328,30 @@ async function readBytes(file: Blob, onRatio: (n: number) => void) {
     offset += part.byteLength;
   }
   return out;
+}
+
+async function readText(file: Blob, onRatio: (n: number) => void) {
+  const total = file.size || 1;
+  const reader = file.stream().getReader();
+  const dec = new TextDecoder();
+  const chunks: string[] = [];
+  let got = 0;
+  let last = 0;
+  let chunkN = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(dec.decode(value, { stream: true }));
+    got += value.byteLength;
+    chunkN++;
+    if (got / total - last > 0.03 || got >= total) {
+      last = got / total;
+      onRatio(Math.min(1, last));
+    }
+    if (chunkN % (total > LARGE_HTML_BYTES ? 2 : 6) === 0) await yieldThread();
+  }
+  chunks.push(dec.decode());
+  return chunks.join("");
 }
 
 function splitHtmlDocuments(html: string): string[] {
@@ -610,7 +629,10 @@ export class Engine {
     this.laser.remove();
   }
 
-  /** FIXED: Added `notePrefs` to resolve `notePrefs is not a function` error */
+  flash(text: string) {
+    this.say(text);
+  }
+
   notePrefs() {
     const invert = this.hooks.getPrefs().invert;
     if (invert !== this.lastInvert) {
@@ -666,16 +688,354 @@ export class Engine {
     }
   }
 
-  private onPointerDown = (e: PointerEvent) => {};
-  private onPointerMove = (e: PointerEvent) => {};
-  private onPointerUp = (e: PointerEvent) => {};
-  private onTouchMove = (e: TouchEvent) => {};
-  private onWheel = (e: WheelEvent) => {};
-  private onScroll = () => {};
-  private onContext = (e: Event) => { e.preventDefault(); };
-  private onPointerLeave = () => {};
-  private blockGesture = (e: Event) => { e.preventDefault(); };
-  private onKey = (e: KeyboardEvent) => {};
+  async openFiles(files: File[]) {
+    const list = [...files];
+    if (!list.length) return;
+    const htmls = list.filter(isHtml);
+    const pdfs = list.filter(isPdf);
+    const media = list.filter(isMedia);
+    try {
+      if (htmls.length) {
+        const main =
+          htmls.find((f) => /(^|\/)index\.html?$/i.test(f.webkitRelativePath || f.name)) ?? htmls[0];
+        await this.openHtmlFile(
+          main,
+          list.filter((f) => f !== main),
+        );
+        return;
+      }
+      if (pdfs.length && media.length === 0) {
+        await this.openPdfFile(pdfs[0]);
+        return;
+      }
+      if (media.length) {
+        await this.openGallery(media);
+        return;
+      }
+      this.say("Use a PDF, an HTML file, or a picture / GIF / video.");
+    } catch (err) {
+      console.error(err);
+      this.patch({ progress: null });
+      this.say(err instanceof Error ? err.message : "Could not open that file", 3600);
+    }
+  }
+
+  async openPdfFile(file: File) {
+    const gen = ++this.docGen;
+    const mb = file.size / (1024 * 1024);
+    if (file.size > HUGE_PDF_BYTES) {
+      this.say(`Very large PDF (${mb.toFixed(0)} MB) — this may take a while`, 3200);
+    } else if (file.size > LARGE_PDF_BYTES) {
+      this.say(`Loading ${mb.toFixed(0)} MB PDF…`, 2400);
+    }
+    this.progress("Reading PDF…", 0, true);
+    const bytes = await readBytes(file, (n) => {
+      if (gen === this.docGen) this.progress("Reading PDF…", n, false);
+    });
+    if (gen !== this.docGen || !this.alive) return;
+    this.progress("Opening PDF…", 1, false);
+    const pdfjs = await loadPdfjs();
+    if (gen !== this.docGen || !this.alive) return;
+    const task = pdfjs.getDocument({
+      data: bytes,
+      isEvalSupported: false,
+      disableAutoFetch: true,
+      disableStream: false,
+      verbosity: 0,
+    });
+    const pdf = (await task.promise) as unknown as PdfDocProxy;
+    if (gen !== this.docGen || !this.alive) {
+      await pdf.destroy();
+      return;
+    }
+    this.clearDoc();
+    this.pdf = pdf;
+    this.pdfBlob = file;
+    this.docName = file.name.replace(/\.pdf$/i, "") || "lesson";
+    this.doc = { kind: "pdf", pages: [] };
+    this.userZoom = 1;
+    this.committedZoom = 1;
+    this.visualRatio = 1;
+    const yieldEvery = pdf.numPages > 40 || file.size > LARGE_PDF_BYTES ? 2 : 4;
+    for (let i = 1; i <= pdf.numPages; i++) {
+      if (gen !== this.docGen) return;
+      const proxy = await pdf.getPage(i);
+      const vp = proxy.getViewport({ scale: 1 });
+      const made = this.makePage(i, vp.width, vp.height);
+      made.pdfNumber = i;
+      this.doc.pages.push(made);
+      proxy.cleanup();
+      if (i === 1 || i % yieldEvery === 0) {
+        this.progress("Preparing pages…", i / pdf.numPages, false);
+        this.layout();
+        await yieldThread();
+      }
+    }
+    this.current = 1;
+    this.layout();
+    this.mountVisible(true);
+    this.emitDoc();
+    this.patch({ progress: null });
+    this.say(`${pdf.numPages} page${pdf.numPages === 1 ? "" : "s"} ready`);
+    this.els.scroll.scrollTop = 0;
+    this.els.scroll.scrollLeft = 0;
+  }
+
+  async openHtmlFile(mainFile: File, assets: File[] = []) {
+    const gen = ++this.docGen;
+    const mb = mainFile.size / (1024 * 1024);
+    if (mainFile.size > HUGE_HTML_BYTES) {
+      this.say(`Very large HTML (${mb.toFixed(0)} MB) — parsing…`, 3200);
+    } else if (mainFile.size > LARGE_HTML_BYTES) {
+      this.say(`Loading ${mb.toFixed(0)} MB HTML lesson…`, 2400);
+    }
+    this.progress("Reading HTML…", 0, true);
+    const text = await readText(mainFile, (n) => {
+      if (gen === this.docGen) this.progress("Reading HTML…", n, false);
+    });
+    if (gen !== this.docGen || !this.alive) return;
+    await this.openHtmlText(mainFile.name, text, assets);
+  }
+
+  async openHtmlText(name: string, html: string, assets: File[] = []) {
+    const gen = ++this.docGen;
+    this.progress("Opening HTML…", 0.15, true);
+    if (!this.alive) return;
+    this.clearDoc();
+    if (gen !== this.docGen || !this.alive) return;
+    const packed = this.packAssets(assets);
+    const source = injectFix(rewriteAssets(html, packed.map));
+    if (gen !== this.docGen || !this.alive) return;
+    this.htmlSource = source;
+    this.docName = name.replace(/\.html?$/i, "") || "lesson";
+    this.userZoom = 1;
+    this.committedZoom = 1;
+    this.visualRatio = 1;
+    const docs = splitHtmlDocuments(source);
+    const avail = this.availableWidth();
+    const fine = typeof window !== "undefined" && window.matchMedia("(pointer: fine)").matches;
+    const layoutW = fine
+      ? Math.max(480, Math.min(1600, avail))
+      : Math.max(280, Math.min(960, avail));
+    const pages: Page[] = [];
+    for (let i = 0; i < docs.length; i++) {
+      const page = this.makePage(i + 1, layoutW, Math.round(layoutW * 1.25));
+      pages.push(page);
+      const blob = new Blob([docs[i]], { type: "text/html" });
+      docs[i] = "";
+      const url = URL.createObjectURL(blob);
+      this.ownedUrls.push(url);
+      const iframe = document.createElement("iframe");
+      iframe.className = "html-frame";
+      iframe.setAttribute(
+        "sandbox",
+        "allow-scripts allow-same-origin allow-forms allow-popups allow-presentation",
+      );
+      iframe.setAttribute("allow", "autoplay; fullscreen; picture-in-picture");
+      iframe.setAttribute("scrolling", "no");
+      iframe.referrerPolicy = "no-referrer";
+      iframe.dataset.src = url;
+      if (i === 0) iframe.src = url;
+      page.iframe = iframe;
+      const fill = page.inner.querySelector(".page-fill");
+      if (fill instanceof HTMLElement) fill.style.display = "none";
+      page.inner.appendChild(iframe);
+      if (i === 0 || i % 2 === 1) {
+        this.progress("Opening HTML…", 0.2 + (0.3 * (i + 1)) / docs.length, false);
+        await yieldThread();
+      }
+    }
+    this.doc = { kind: "html", pages };
+    this.current = 1;
+    this.layout();
+    this.emitDoc();
+    for (let i = 0; i < pages.length; i++) {
+      if (gen !== this.docGen || !this.alive) return;
+      const frame = pages[i].iframe;
+      if (frame?.src) {
+        await waitForFrame(frame, i === 0 ? 2000 : 1200);
+        this.measureHtml(pages[i], layoutW);
+      } else {
+        pages[i].baseH = Math.round(layoutW * 1.15);
+        this.ensureTiles(pages[i]);
+      }
+      this.progress("Laying out HTML…", 0.55 + (0.4 * (i + 1)) / pages.length, false);
+      if (i % 2 === 1) await yieldThread();
+    }
+    if (gen !== this.docGen || !this.alive) return;
+    this.watchHtml();
+    this.layout();
+    this.mountVisible(true);
+    this.patch({ progress: null });
+    this.say(
+      pages.length > 1
+        ? `HTML ready — ${pages.length} pages (large pages load as you scroll)`
+        : "HTML ready — GIFs and video stay live",
+    );
+    this.els.scroll.scrollTop = 0;
+    this.els.scroll.scrollLeft = 0;
+    window.setTimeout(() => {
+      if (gen !== this.docGen || this.doc?.kind !== "html") return;
+      for (const page of this.doc.pages) {
+        if (page.iframe?.src) this.measureHtml(page, layoutW);
+      }
+      this.layout();
+      this.mountVisible(false);
+    }, 500);
+  }
+
+  async openGallery(files: File[]) {
+    const gen = ++this.docGen;
+    this.clearDoc();
+    const pages: Page[] = [];
+    for (let i = 0; i < files.length; i++) {
+      const f = files[i];
+      const page = this.makePage(i + 1, 800, 1000);
+      page.paper = "#111111";
+      const fill = page.inner.querySelector(".page-fill");
+      if (fill instanceof HTMLElement) fill.style.display = "none";
+      const kind = mediaKind(f);
+      const url = URL.createObjectURL(f);
+      this.ownedUrls.push(url);
+      if (kind === "video") {
+        const video = document.createElement("video");
+        video.src = url;
+        video.controls = true;
+        video.setAttribute("playsinline", "");
+        video.setAttribute("webkit-playsinline", "");
+        video.style.width = "100%";
+        video.style.height = "auto";
+        page.inner.appendChild(video);
+      } else {
+        const img = document.createElement("img");
+        img.src = url;
+        img.style.width = "100%";
+        img.style.height = "auto";
+        page.inner.appendChild(img);
+      }
+      pages.push(page);
+    }
+    this.doc = { kind: "html", pages };
+    this.current = 1;
+    this.layout();
+    this.emitDoc();
+    this.say(`Opened ${files.length} media file${files.length === 1 ? "" : "s"}`);
+  }
+
+  undo() {
+    const page = this.currentPage();
+    if (!page?.past.length) {
+      this.say("Nothing to undo");
+      return;
+    }
+    page.future.push(this.serialize(page));
+    const raw = page.past.pop();
+    if (raw) this.restore(page, raw);
+    this.syncHistory();
+  }
+
+  redo() {
+    const page = this.currentPage();
+    if (!page?.future.length) {
+      this.say("Nothing to redo");
+      return;
+    }
+    page.past.push(this.serialize(page));
+    const raw = page.future.pop();
+    if (raw) this.restore(page, raw);
+    this.syncHistory();
+  }
+
+  clearPage() {
+    const page = this.currentPage();
+    if (!page) return;
+    if (!page.objects.length && !page.media.length) {
+      this.say("This page is already clear");
+      return;
+    }
+    this.snapshot(page);
+    page.objects = [];
+    page.media = [];
+    this.syncMedia(page);
+    this.paintPage(page);
+    this.say("Page cleared");
+  }
+
+  addBlank(tone: "white" | "black") {
+    const paper = tone === "black" ? "#111111" : "#ffffff";
+    if (!this.doc) {
+      this.docName = "blank";
+      this.userZoom = 1;
+      this.committedZoom = 1;
+      this.visualRatio = 1;
+      this.doc = { kind: "pdf", pages: [] };
+      this.current = 0;
+    }
+    const ref = this.currentPage();
+    const page = this.makePage(this.doc.pages.length + 1, ref?.baseW || 612, ref?.baseH || 792);
+    page.paper = paper;
+    page.pdfNumber = null;
+    const fill = page.inner.querySelector(".page-fill");
+    if (fill instanceof HTMLElement) {
+      fill.style.display = "grid";
+      fill.style.background = paper;
+      fill.style.color = tone === "black" ? "#9ca3af" : "#8a8175";
+      fill.textContent = "Blank";
+    }
+    const at = this.doc.pages.length ? Math.min(this.doc.pages.length, Math.max(0, this.current)) : 0;
+    this.doc.pages.splice(at, 0, page);
+    this.orderPages();
+    this.current = at + 1;
+    this.layout();
+    this.mountVisible(true);
+    this.emitDoc();
+    this.syncHistory();
+    this.goTo(this.current);
+    this.say(tone === "black" ? "Black page added" : "White page added");
+  }
+
+  private orderPages() {
+    if (!this.doc) return;
+    for (let index = 0; index < this.doc.pages.length; index++) {
+      const page = this.doc.pages[index];
+      page.index = index + 1;
+      page.shell.dataset.page = String(page.index);
+      this.els.stage.appendChild(page.shell);
+    }
+  }
+
+  zoomIn() {
+    this.zoomAround(this.userZoom * 1.2);
+  }
+
+  zoomOut() {
+    this.zoomAround(this.userZoom / 1.2);
+  }
+
+  fit() {
+    this.zoomAround(1);
+  }
+
+  prev() {
+    this.goTo(this.current - 1);
+  }
+
+  next() {
+    this.goTo(this.current + 1);
+  }
+
+  goTo(n: number) {
+    const page = this.doc?.pages[n - 1];
+    if (!page) return;
+    const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    page.shell.scrollIntoView({ behavior: reduce ? "auto" : "smooth", block: "start" });
+  }
+
+  async askPage() {
+    if (!this.doc) return;
+    const n = await this.hooks.requestPage(this.current, this.doc.pages.length);
+    if (n && n >= 1 && n <= this.doc.pages.length) this.goTo(n);
+  }
 
   private availableWidth(): number {
     return this.els.scroll.clientWidth || window.innerWidth || 800;
@@ -687,6 +1047,10 @@ export class Engine {
 
   private patch(p: TeachPatch) {
     this.hooks.patch(p);
+  }
+
+  private progress(label: string, ratio: number, show = true) {
+    this.patch({ progress: show ? { label, ratio } : null });
   }
 
   private clearDoc() {
@@ -703,6 +1067,61 @@ export class Engine {
     this.pageByEl.clear();
   }
 
+  private makePage(index: number, baseW: number, baseH: number): Page {
+    const shell = document.createElement("div");
+    shell.className = "page-shell";
+    shell.style.margin = "0 0 1px 0";
+    shell.style.padding = "0";
+
+    const inner = document.createElement("div");
+    inner.className = "page-inner";
+
+    const fill = document.createElement("div");
+    fill.className = "page-fill";
+
+    const mediaLayer = document.createElement("div");
+    mediaLayer.className = "media-layer";
+
+    const tilesHost = document.createElement("div");
+    tilesHost.className = "tiles-host";
+
+    inner.appendChild(fill);
+    inner.appendChild(tilesHost);
+    inner.appendChild(mediaLayer);
+    shell.appendChild(inner);
+
+    const page: Page = {
+      index,
+      baseW,
+      baseH,
+      shell,
+      inner,
+      mediaLayer,
+      tilesHost,
+      tiles: [],
+      objects: [],
+      media: [],
+      past: [],
+      future: [],
+      renderGen: 0,
+      mounted: false,
+      pdfNumber: index,
+      paper: null,
+    };
+    this.pageByEl.set(shell, page);
+    return page;
+  }
+
+  private packAssets(assets: File[]) {
+    const map = new Map<string, string>();
+    for (const f of assets) {
+      const url = URL.createObjectURL(f);
+      this.ownedUrls.push(url);
+      map.set(f.name, url);
+    }
+    return { map };
+  }
+
   private layout() {}
   private mountVisible(force = false) {}
   private emitDoc() {}
@@ -713,4 +1132,27 @@ export class Engine {
   private stopMomentum() {}
   private clearHoldPan() {}
   private relayoutKeepCenter() {}
+  private zoomAround(z: number) {}
+  private currentPage(): Page | null {
+    return this.doc?.pages[this.current - 1] ?? null;
+  }
+  private serialize(p: Page): string { return ""; }
+  private restore(p: Page, raw: string) {}
+  private syncMedia(p: Page) {}
+  private paintPage(p: Page) {}
+  private measureHtml(p: Page, w: number) {}
+  private ensureTiles(p: Page) {}
+  private watchHtml() {}
+  private snapshot(p: Page) {}
+
+  private onPointerDown = (e: PointerEvent) => {};
+  private onPointerMove = (e: PointerEvent) => {};
+  private onPointerUp = (e: PointerEvent) => {};
+  private onTouchMove = (e: TouchEvent) => {};
+  private onWheel = (e: WheelEvent) => {};
+  private onScroll = () => {};
+  private onContext = (e: Event) => { e.preventDefault(); };
+  private onPointerLeave = () => {};
+  private blockGesture = (e: Event) => { e.preventDefault(); };
+  private onKey = (e: KeyboardEvent) => {};
 }
