@@ -158,7 +158,7 @@ video{
 .page,.pdf-page,.pdfPage,.slide,section.page,[data-page]{
   display:block!important;visibility:visible!important;opacity:1!important;
   position:relative!important;inset:auto!important;transform:none!important;
-  overflow:visible!important;height:auto!important;min-height:0;
+  overflow:visible!important;height:auto!important;min-height:0!important;
   margin-top:0!important;margin-bottom:0!important;
 }
 .iframe-wrap,.live-frame,iframe{
@@ -217,8 +217,19 @@ video{
     v.style.touchAction = "manipulation";
     v.style.pointerEvents = "auto";
   }
+  function eager(img){
+    try{
+      img.loading="eager";
+      var ds=img.getAttribute("data-src")||img.getAttribute("data-lazy-src")||img.getAttribute("data-original");
+      var cur=img.getAttribute("src")||"";
+      if(ds && (!cur || cur.indexOf("data:")===0) && ds!==cur) img.setAttribute("src",ds);
+      var dss=img.getAttribute("data-srcset");
+      if(dss && !img.getAttribute("srcset")) img.setAttribute("srcset",dss);
+    }catch(e){}
+  }
   function scan(root){
     if(!root.querySelectorAll) return;
+    root.querySelectorAll("img").forEach(eager);
     root.querySelectorAll("video").forEach(fix);
     root.querySelectorAll(".tap-to-play").forEach(function(btn){
       btn.style.pointerEvents = "auto";
@@ -246,6 +257,7 @@ video{
         m.addedNodes.forEach(function(n){
           if(!n.tagName) return;
           if(n.tagName==="VIDEO") fix(n);
+          else if(n.tagName==="IMG") eager(n);
           else scan(n);
         });
       });
@@ -856,7 +868,7 @@ export class Engine {
         this.measureHtml(pages[i], layoutW);
       } else {
         // Placeholder height until the page is scrolled into view
-        pages[i].baseH = Math.round(layoutW * 1.15);
+        pages[i].baseH = Math.min(Math.round(layoutW * 1.15), 420);
         this.ensureTiles(pages[i]);
       }
       this.progress("Laying out HTML…", 0.55 + (0.4 * (i + 1)) / pages.length, false);
@@ -1382,7 +1394,7 @@ export class Engine {
         vid.style.aspectRatio = `${vid.videoWidth} / ${vid.videoHeight}`;
         const ideal = Math.round(contentW * ratio);
         if (ideal > 120) vid.style.minHeight = `${Math.min(ideal, 720)}px`;
-      } else if (!fine || narrow) {
+      } else {
         vid.style.minHeight = `${Math.round(contentW * 0.56)}px`;
       }
     }
@@ -1416,8 +1428,27 @@ export class Engine {
     }
     void body.offsetHeight;
 
+    for (const wrap of body.querySelectorAll(".iframe-wrap")) {
+      if (!(wrap instanceof HTMLElement)) continue;
+      if (wrap.getBoundingClientRect().height < 200) {
+        wrap.style.minHeight = `${interactH}px`;
+        wrap.style.height = `${interactH}px`;
+        for (const frame of wrap.querySelectorAll("iframe, .live-frame")) {
+          if (frame instanceof HTMLElement) frame.style.height = "100%";
+        }
+      }
+    }
+    void body.offsetHeight;
+
     const sw = Math.max(root.scrollWidth, body.scrollWidth, layoutW);
     let sh = Math.max(body.scrollHeight, Math.ceil(body.getBoundingClientRect().height), 8);
+    const cards = body.querySelectorAll(".page, .pdf-page, .pdfPage, .slide, section.page, [data-page]");
+    if (cards.length === 1 && cards[0] instanceof HTMLElement) {
+      const r = cards[0].getBoundingClientRect();
+      const mb = Number.parseFloat(doc.defaultView?.getComputedStyle(cards[0]).marginBottom || "0") || 0;
+      // Card bottom only: the lesson's own body background below the card is not content.
+      sh = Math.max(8, Math.ceil(r.bottom + Math.max(0, mb)));
+    }
 
     let stack = 0;
     for (const el of body.querySelectorAll("img,video,canvas,svg,iframe,.iframe-wrap,.page")) {
@@ -1437,6 +1468,7 @@ export class Engine {
     // sit outside the main flow on some interactive pages.
     for (const el of body.querySelectorAll(".page-number,.gif-label,.tap-to-play")) {
       if (!(el instanceof HTMLElement)) continue;
+      if (doc.defaultView?.getComputedStyle(el).position === "fixed") continue;
       const rect = el.getBoundingClientRect();
       stack = Math.max(stack, rect.bottom + 12);
     }
@@ -1507,8 +1539,13 @@ export class Engine {
     const body = page.iframe?.contentDocument?.body;
     if (!body) return;
     if (Math.abs(body.scrollHeight - (page.lastBodyH ?? -99)) <= 3) return;
+    const view = this.els.scroll.getBoundingClientRect();
+    const beforeTop = page.shell.getBoundingClientRect().top;
+    const beforeH = page.shell.getBoundingClientRect().height;
     this.measureHtml(page, this.htmlLayoutW || page.baseW);
     this.layout();
+    const afterH = page.shell.getBoundingClientRect().height;
+    if (beforeTop + beforeH <= view.top + 4) this.els.scroll.scrollTop += afterH - beforeH;
     this.mountVisible(false);
   }
 
