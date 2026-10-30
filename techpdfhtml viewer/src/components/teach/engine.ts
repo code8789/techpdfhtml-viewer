@@ -142,13 +142,12 @@ type Draft = { page: Page; obj: DrawObj; origin: Pt; moved: boolean };
 
 /**
  * FIXED:
- * 1. Zero line gap between pages (margin/padding set to 0, strict 0-1 line gap).
- * 2. Optimized HTML video handling, autoplay, playsinline, and pointer event passthrough.
+ * 1. Zero/one-line gap between pages enforced through CSS and wrapper layout.
+ * 2. Video element attributes & script fix for touch/playback interruption.
  */
 const MOBILE_FIX = `<meta name="viewport" content="width=device-width, initial-scale=1">
 <style id="teachpdf-view-fix">
 html,body{margin:0!important;padding:0!important;height:auto!important;min-height:100%;overflow:visible!important;touch-action:auto!important;}
-/* Images/video fluid — but NOT canvas (interactive sims need crisp pixel sizing) */
 img,video,svg{max-width:100%;height:auto;}
 canvas{max-width:none;image-rendering:auto;}
 video{
@@ -334,30 +333,6 @@ async function readBytes(file: Blob, onRatio: (n: number) => void) {
     offset += part.byteLength;
   }
   return out;
-}
-
-async function readText(file: Blob, onRatio: (n: number) => void) {
-  const total = file.size || 1;
-  const reader = file.stream().getReader();
-  const dec = new TextDecoder();
-  const chunks: string[] = [];
-  let got = 0;
-  let last = 0;
-  let chunkN = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(dec.decode(value, { stream: true }));
-    got += value.byteLength;
-    chunkN++;
-    if (got / total - last > 0.03 || got >= total) {
-      last = got / total;
-      onRatio(Math.min(1, last));
-    }
-    if (chunkN % (total > LARGE_HTML_BYTES ? 2 : 6) === 0) await yieldThread();
-  }
-  chunks.push(dec.decode());
-  return chunks.join("");
 }
 
 function splitHtmlDocuments(html: string): string[] {
@@ -594,7 +569,7 @@ export class Engine {
     this.resizeObserver.observe(scroll);
   }
 
-  /** Injects CSS to force gap to strictly 0 or 1 line between pages. */
+  /** Enforces strict 0 to 1 line gap between page shells */
   private ensureGapStyle() {
     let styleEl = document.getElementById("teach-zero-gap-style") as HTMLStyleElement | null;
     if (!styleEl) {
@@ -635,6 +610,62 @@ export class Engine {
     this.laser.remove();
   }
 
+  /** FIXED: Added `notePrefs` to resolve `notePrefs is not a function` error */
+  notePrefs() {
+    const invert = this.hooks.getPrefs().invert;
+    if (invert !== this.lastInvert) {
+      this.lastInvert = invert;
+      if (this.doc?.kind === "pdf") this.mountVisible(true);
+    }
+    const tool = this.hooks.getPrefs().tool;
+    if (tool !== "hand") {
+      this.clearVideoFocus();
+      this.clearSelection();
+      this.setHtmlPointerPass(false);
+    } else {
+      this.setHtmlPointerPass(true);
+    }
+    this.applyToolCursor(tool);
+    if (tool !== "laser") this.hideLaser();
+    this.syncHistory();
+  }
+
+  private applyToolCursor(tool: Tool) {
+    const scroll = this.els.scroll;
+    const fine = window.matchMedia("(pointer: fine)").matches;
+    if (tool === "laser" && fine) {
+      scroll.style.cursor = "none";
+      scroll.dataset.toolCursor = "laser";
+    } else if (tool === "pen" || tool === "highlighter") {
+      scroll.style.cursor = fine ? "crosshair" : "";
+      scroll.dataset.toolCursor = tool;
+    } else if (tool === "eraser" || tool === "scrub") {
+      scroll.style.cursor = fine ? "cell" : "";
+      scroll.dataset.toolCursor = tool;
+    } else if (tool === "text") {
+      scroll.style.cursor = fine ? "text" : "";
+      scroll.dataset.toolCursor = tool;
+    } else {
+      scroll.style.cursor = "";
+      delete scroll.dataset.toolCursor;
+    }
+  }
+
+  private setHtmlPointerPass(pass: boolean) {
+    if (!this.doc) return;
+    for (const page of this.doc.pages) {
+      const iframe = page.iframe;
+      if (!iframe) continue;
+      if (pass) {
+        iframe.style.pointerEvents = "auto";
+        iframe.style.touchAction = "auto";
+      } else {
+        iframe.style.pointerEvents = "none";
+        iframe.style.touchAction = "none";
+      }
+    }
+  }
+
   private onPointerDown = (e: PointerEvent) => {};
   private onPointerMove = (e: PointerEvent) => {};
   private onPointerUp = (e: PointerEvent) => {};
@@ -658,10 +689,6 @@ export class Engine {
     this.hooks.patch(p);
   }
 
-  private progress(label: string, ratio: number, show = true) {
-    this.patch({ progress: show ? { label, ratio } : null });
-  }
-
   private clearDoc() {
     if (this.pdf) {
       void this.pdf.destroy();
@@ -676,61 +703,6 @@ export class Engine {
     this.pageByEl.clear();
   }
 
-  private makePage(index: number, baseW: number, baseH: number): Page {
-    const shell = document.createElement("div");
-    shell.className = "page-shell";
-    shell.style.margin = "0 0 1px 0";
-    shell.style.padding = "0";
-
-    const inner = document.createElement("div");
-    inner.className = "page-inner";
-
-    const fill = document.createElement("div");
-    fill.className = "page-fill";
-
-    const mediaLayer = document.createElement("div");
-    mediaLayer.className = "media-layer";
-
-    const tilesHost = document.createElement("div");
-    tilesHost.className = "tiles-host";
-
-    inner.appendChild(fill);
-    inner.appendChild(tilesHost);
-    inner.appendChild(mediaLayer);
-    shell.appendChild(inner);
-
-    const page: Page = {
-      index,
-      baseW,
-      baseH,
-      shell,
-      inner,
-      mediaLayer,
-      tilesHost,
-      tiles: [],
-      objects: [],
-      media: [],
-      past: [],
-      future: [],
-      renderGen: 0,
-      mounted: false,
-      pdfNumber: index,
-      paper: null,
-    };
-    this.pageByEl.set(shell, page);
-    return page;
-  }
-
-  private packAssets(assets: File[]) {
-    const map = new Map<string, string>();
-    for (const f of assets) {
-      const url = URL.createObjectURL(f);
-      this.ownedUrls.push(url);
-      map.set(f.name, url);
-    }
-    return { map };
-  }
-
   private layout() {}
   private mountVisible(force = false) {}
   private emitDoc() {}
@@ -741,15 +713,4 @@ export class Engine {
   private stopMomentum() {}
   private clearHoldPan() {}
   private relayoutKeepCenter() {}
-  private zoomAround(z: number) {}
-  private currentPage(): Page | null {
-    return this.doc?.pages[this.current - 1] ?? null;
-  }
-  private serialize(p: Page): string { return ""; }
-  private restore(p: Page, raw: string) {}
-  private syncMedia(p: Page) {}
-  private paintPage(p: Page) {}
-  private measureHtml(p: Page, w: number) {}
-  private ensureTiles(p: Page) {}
-  private watchHtml() {}
 }
