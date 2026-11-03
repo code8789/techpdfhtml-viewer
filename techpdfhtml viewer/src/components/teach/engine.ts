@@ -11,7 +11,7 @@ import {
 
 const TILE = 1800;
 const MIN_Z = 0.5;
-const MAX_Z = 6;
+const MAX_Z = 20;
 const HISTORY = 40;
 const DOCK_GAP = 92;
 const MAX_EDGE = 1536;
@@ -142,17 +142,13 @@ type Draft = { page: Page; obj: DrawObj; origin: Pt; moved: boolean };
 
 const MOBILE_FIX = `<meta name="viewport" content="width=device-width, initial-scale=1">
 <style id="teachpdf-view-fix">
-html,body{margin:0;height:auto!important;min-height:100%;overflow:visible!important;touch-action:auto!important;}
-/* Images/video fluid — but NOT canvas (interactive sims need crisp pixel sizing) */
-img,video,svg{max-width:100%!important;width:100%!important;height:auto!important;display:block!important;margin:0 auto!important;}
-figure,picture{width:100%!important;max-width:100%!important;margin:0!important;}
-canvas{max-width:none;image-rendering:auto;}
+html,body{margin:0;background:#fff;height:auto!important;min-height:100%;overflow:visible!important;touch-action:auto!important;}
+img,video,svg,canvas{max-width:100%;height:auto;}
 video{
   background:#000;
   touch-action:manipulation!important;
   pointer-events:auto!important;
   -webkit-playsinline:true;
-  playsinline:true;
 }
 .page,.pdf-page,.pdfPage,.slide,section.page,[data-page]{
   display:block!important;visibility:visible!important;opacity:1!important;
@@ -163,46 +159,43 @@ video{
   touch-action:auto!important;
   pointer-events:auto!important;
 }
+.iframe-wrap{
+  width:100%!important;
+  max-width:100%!important;
+  height:auto!important;
+  min-height:280px!important;
+  aspect-ratio:1 / 1.05;
+  margin:0 auto!important;
+}
+.live-frame, .iframe-wrap > iframe{
+  width:100%!important;
+  height:100%!important;
+  min-height:280px!important;
+  border:0!important;
+  display:block!important;
+}
+.page video, video{
+  width:100%!important;
+  max-width:100%!important;
+  height:auto!important;
+  max-height:none!important;
+  display:block!important;
+  margin:0 auto!important;
+}
+.page img{
+  max-width:100%!important;
+  height:auto!important;
+  max-height:none!important;
+}
+.page{
+  padding:10px!important;
+  min-height:auto!important;
+}
 .tap-to-play{
   touch-action:manipulation!important;
   pointer-events:auto!important;
   cursor:pointer;
   z-index:10!important;
-}
-/* Mobile-only layout helpers — do not blunt desktop HD canvas lessons */
-@media (max-width: 760px) {
-  .iframe-wrap{
-    width:100%!important;
-    max-width:100%!important;
-    height:auto!important;
-    min-height:280px!important;
-    aspect-ratio:1 / 1.05;
-    margin:0 auto!important;
-  }
-  .live-frame, .iframe-wrap > iframe{
-    width:100%!important;
-    height:100%!important;
-    min-height:280px!important;
-    border:0!important;
-    display:block!important;
-  }
-  .page video, video{
-    width:100%!important;
-    max-width:100%!important;
-    height:auto!important;
-    max-height:none!important;
-    display:block!important;
-    margin:0 auto!important;
-  }
-  .page img{
-    max-width:100%!important;
-    height:auto!important;
-    max-height:none!important;
-  }
-  .page{
-    padding:10px!important;
-    min-height:auto!important;
-  }
 }
 </style>
 <script id="teachpdf-media-fix">
@@ -223,22 +216,8 @@ video{
       btn.style.touchAction = "manipulation";
     });
   }
-  function sharpenCanvas(){
-    try{
-      document.querySelectorAll("canvas").forEach(function(c){
-        if(!c.getContext) return;
-        var r=c.getBoundingClientRect();
-        if(r.width<2||r.height<2) return;
-        // Do not override apps that already size via their own resize();
-        // only set CSS so the bitmap can fill crisply.
-        c.style.maxWidth="none";
-      });
-    }catch(e){}
-  }
   function start(){
     scan(document);
-    sharpenCanvas();
-    window.addEventListener("resize",function(){ setTimeout(sharpenCanvas,50); });
     new MutationObserver(function(ms){
       ms.forEach(function(m){
         m.addedNodes.forEach(function(n){
@@ -526,13 +505,6 @@ export class Engine {
   /** Desktop: click-hold converts draw/laser into pan */
   private holdPanTimer = 0;
   private holdPanAt: { x: number; y: number } | null = null;
-  /** Hand tool on HTML: wait to see if user clicks (video) or drags (pan) */
-  private htmlHandPending: {
-    x: number;
-    y: number;
-    pointerId: number;
-    page: Page;
-  } | null = null;
   private pinchDist = 1;
   private pinchStartZoom = 1;
   private lastMid = { x: 0, y: 0 };
@@ -564,7 +536,6 @@ export class Engine {
   } | null = null;
   private laser: HTMLDivElement;
   private videoFocus = false;
-  private contentOverlay: HTMLDivElement | null = null;
   private paintRaf = 0;
   private scrollRaf = 0;
   private statusN = 0;
@@ -581,7 +552,6 @@ export class Engine {
     this.laser = document.createElement("div");
     this.laser.className = "laser-dot";
     document.body.appendChild(this.laser);
-    this.ensureGapStyle();
     const scroll = els.scroll;
     scroll.addEventListener("pointerdown", this.onPointerDown, { capture: true });
     scroll.addEventListener("pointermove", this.onPointerMove, { capture: true });
@@ -592,7 +562,6 @@ export class Engine {
     scroll.addEventListener("scroll", this.onScroll, { passive: true });
     scroll.addEventListener("contextmenu", this.onContext);
     scroll.addEventListener("pointerleave", this.onPointerLeave);
-    scroll.addEventListener("pointermove", this.onScrollEdgeHover, { passive: true });
     scroll.addEventListener("gesturestart", this.blockGesture);
     scroll.addEventListener("gesturechange", this.blockGesture);
     window.addEventListener("keydown", this.onKey);
@@ -622,7 +591,6 @@ export class Engine {
     scroll.removeEventListener("scroll", this.onScroll);
     scroll.removeEventListener("contextmenu", this.onContext);
     scroll.removeEventListener("pointerleave", this.onPointerLeave);
-    scroll.removeEventListener("pointermove", this.onScrollEdgeHover);
     scroll.removeEventListener("gesturestart", this.blockGesture);
     scroll.removeEventListener("gesturechange", this.blockGesture);
     window.removeEventListener("keydown", this.onKey);
@@ -802,17 +770,10 @@ export class Engine {
     this.visualRatio = 1;
     const docs = splitHtmlDocuments(source);
     // Free the giant source string from the open path ASAP after split
-    // Desktop: match page width to the viewport so CSS scale stays ~1 (sharp canvas).
-    // Mobile: keep a sensible min width.
-    const avail = this.availableWidth();
-    const fine = typeof window !== "undefined" && window.matchMedia("(pointer: fine)").matches;
-    const layoutW = fine
-      ? Math.max(480, Math.min(1600, avail))
-      : Math.max(280, Math.min(960, avail));
-    this.htmlLayoutW = layoutW;
+    const layoutW = Math.max(280, Math.min(960, this.availableWidth()));
     const pages: Page[] = [];
     for (let i = 0; i < docs.length; i++) {
-      const page = this.makePage(i + 1, layoutW, Math.round(layoutW * 0.5));
+      const page = this.makePage(i + 1, layoutW, Math.round(layoutW * 1.25));
       pages.push(page);
       const blob = new Blob([docs[i]], { type: "text/html" });
       // Drop page HTML string from array to help GC on 30MB lessons
@@ -853,35 +814,21 @@ export class Engine {
         this.measureHtml(pages[i], layoutW);
       } else {
         // Placeholder height until the page is scrolled into view
-        pages[i].baseH = Math.round(layoutW * 0.5);
+        pages[i].baseH = Math.round(layoutW * 1.15);
         this.ensureTiles(pages[i]);
       }
       this.progress("Laying out HTML…", 0.55 + (0.4 * (i + 1)) / pages.length, false);
       if (i % 2 === 1) await yieldThread();
     }
     if (gen !== this.docGen || !this.alive) return;
-    // Second pass after images decode — fixes too-short pages
-    await yieldThread();
-    for (let i = 0; i < pages.length; i++) {
-      if (gen !== this.docGen || !this.alive) return;
-      if (!pages[i].iframe?.src) continue;
-      this.measureHtml(pages[i], layoutW);
-    }
     this.watchHtml();
     this.layout();
     this.mountVisible(true);
-    for (const page of pages) this.ensureContentFsButton(page);
-    // Fill the desktop viewer
-    try {
-      this.fit();
-    } catch {
-      /* ignore */
-    }
     this.patch({ progress: null });
     this.say(
       pages.length > 1
-        ? `HTML ready — ${pages.length} pages · fit to screen`
-        : "HTML ready · fit to screen",
+        ? `HTML ready — ${pages.length} pages (large pages load as you scroll)`
+        : "HTML ready — GIFs and video stay live",
     );
     this.els.scroll.scrollTop = 0;
     this.els.scroll.scrollLeft = 0;
@@ -979,65 +926,15 @@ export class Engine {
   }
 
   zoomIn() {
-    // 10% steps, snapped (e.g. 100 → 110 → 120)
-    const next = Math.round((this.userZoom + 0.1) * 10) / 10;
-    this.zoomAround(next);
+    this.zoomAround(this.userZoom * 1.2);
   }
 
   zoomOut() {
-    const next = Math.round((this.userZoom - 0.1) * 10) / 10;
-    this.zoomAround(next);
+    this.zoomAround(this.userZoom / 1.2);
   }
 
-  /**
-   * Fit the current page to the whole desktop viewer
-   * (as large as possible without cropping).
-   */
   fit() {
-    if (!this.doc) {
-      this.zoomAround(1);
-      return;
-    }
-    const page = this.currentPage() || this.doc.pages[0];
-    if (!page || page.baseW < 8 || page.baseH < 8) {
-      this.zoomAround(1);
-      return;
-    }
-    // Ensure HTML base width matches the desktop viewer first
-    if (this.doc.kind === "html") {
-      const targetW = this.availableWidth();
-      if (Math.abs(page.baseW - targetW) > 8) {
-        for (const p of this.doc.pages) {
-          if (p.iframe?.contentDocument?.body) {
-            this.measureHtml(p, targetW);
-          } else {
-            const ratio = p.baseH / Math.max(1, p.baseW);
-            p.baseW = targetW;
-            p.baseH = Math.max(48, Math.round(targetW * ratio));
-            this.ensureTiles(p);
-          }
-        }
-        this.htmlLayoutW = targetW;
-        this.layout();
-      }
-    }
-    const availW = Math.max(1, this.availableWidth());
-    const viewW = Math.max(1, this.els.scroll.clientWidth - 4);
-    const viewH = Math.max(1, this.els.scroll.clientHeight - 4);
-    // On-screen size at zoom Z: width = availW * Z, height = baseH * (availW/baseW) * Z
-    const zForWidth = viewW / availW;
-    const zForHeight = viewH / (page.baseH * (availW / page.baseW));
-    let z = Math.min(zForWidth, zForHeight);
-    z = clamp(z, MIN_Z, MAX_Z);
-    z = Math.round(z * 20) / 20; // 5% steps
-    this.userZoom = z;
-    this.committedZoom = z;
-    this.visualRatio = 1;
-    this.layout();
-    this.hooks.onZoom(z);
-    this.patch({ zoom: z });
-    this.goTo(this.current);
-    this.say(`Fit to screen · ${Math.round(z * 100)}%`);
+    this.zoomAround(1);
   }
 
   prev() {
@@ -1099,7 +996,6 @@ export class Engine {
     page.media.push(media);
     this.syncMedia(page);
     this.selectMedia(media.id);
-    this.ensureContentFsButton(page);
     this.say(
       kind === "video"
         ? "Video added — drag / rotate / resize"
@@ -1379,185 +1275,159 @@ export class Engine {
   }
 
   private measureHtml(page: Page, layoutW: number) {
-    const iframe = page.iframe;
-    const doc = iframe?.contentDocument;
-    if (!iframe || !doc?.body) {
-      page.baseW = layoutW;
-      page.baseH = Math.round(layoutW * 0.65);
+    const doc = page.iframe?.contentDocument;
+    if (!doc?.body) {
+      page.baseH = Math.round(layoutW * 1.25);
       this.ensureTiles(page);
       return;
     }
     const body = doc.body;
     const root = doc.documentElement;
-    const win = doc.defaultView;
-    page.baseW = layoutW;
 
-    // --- Force media to full page width (fixes left thumbnail + empty white) ---
-    body.style.setProperty("margin", "0", "important");
-    body.style.setProperty("padding", "0", "important");
-    body.style.setProperty("width", "100%", "important");
-    root.style.setProperty("width", "100%", "important");
+    // Mobile: give interactive blocks nearly full page width and a tall
+    // nearly-square height so CRT / atom sims are not squashed.
+    const contentW = Math.max(260, layoutW - 24);
+    // Prefer ~1:1 up to ~1.15 height ratio; floor so small phones still usable
+    const interactH = Math.round(
+      Math.min(720, Math.max(contentW * 1.05, Math.min(contentW * 1.2, 560))),
+    );
 
-    for (const el of body.querySelectorAll<HTMLElement>(
-      ".page,.pdf-page,.slide,section.page,[data-page],main,article,figure,picture,header,section,div",
-    )) {
-      el.style.setProperty("min-height", "0", "important");
-      el.style.setProperty("max-width", "100%", "important");
-      // Do not force every div to 100% width (breaks layouts); only clear float constraints
-      if (el.tagName === "FIGURE" || el.tagName === "PICTURE" || el.classList.contains("page")) {
-        el.style.setProperty("width", "100%", "important");
-        el.style.setProperty("margin", "0", "important");
-        el.style.setProperty("padding", "0", "important");
+    for (const wrap of body.querySelectorAll(".iframe-wrap")) {
+      if (!(wrap instanceof HTMLElement)) continue;
+      wrap.style.boxSizing = "border-box";
+      wrap.style.width = "100%";
+      wrap.style.maxWidth = "100%";
+      wrap.style.height = `${interactH}px`;
+      wrap.style.minHeight = `${interactH}px`;
+      wrap.style.maxHeight = "none";
+      wrap.style.margin = "0 auto";
+      wrap.style.overflow = "hidden";
+      for (const frame of wrap.querySelectorAll("iframe, .live-frame")) {
+        if (!(frame instanceof HTMLElement)) continue;
+        frame.style.width = "100%";
+        frame.style.height = "100%";
+        frame.style.minHeight = `${interactH}px`;
+        frame.style.border = "0";
+        frame.style.display = "block";
       }
     }
 
-    for (const img of body.querySelectorAll("img")) {
-      if (!(img instanceof HTMLImageElement)) continue;
-      img.style.setProperty("max-width", "100%", "important");
-      img.style.setProperty("width", "100%", "important");
-      img.style.setProperty("height", "auto", "important");
-      img.style.setProperty("display", "block", "important");
-      img.style.setProperty("margin", "0 auto", "important");
-      img.style.setProperty("object-fit", "contain", "important");
-    }
     for (const vid of body.querySelectorAll("video")) {
       if (!(vid instanceof HTMLVideoElement)) continue;
+      vid.style.boxSizing = "border-box";
+      vid.style.maxWidth = "100%";
+      vid.style.width = "100%";
+      vid.style.height = "auto";
+      vid.style.maxHeight = "none";
+      vid.style.display = "block";
+      vid.style.margin = "0 auto";
       vid.controls = true;
       vid.setAttribute("playsinline", "");
       vid.setAttribute("webkit-playsinline", "");
-      vid.style.setProperty("max-width", "100%", "important");
-      vid.style.setProperty("width", "100%", "important");
-      vid.style.setProperty("height", "auto", "important");
-      vid.style.setProperty("display", "block", "important");
-      vid.style.pointerEvents = "auto";
+      // If metadata known, reserve space so layout does not jump/compress
+      if (vid.videoWidth > 0 && vid.videoHeight > 0) {
+        const ratio = vid.videoHeight / vid.videoWidth;
+        vid.style.aspectRatio = `${vid.videoWidth} / ${vid.videoHeight}`;
+        const ideal = Math.round(contentW * ratio);
+        if (ideal > 120) vid.style.minHeight = `${Math.min(ideal, 720)}px`;
+      } else {
+        vid.style.minHeight = `${Math.round(contentW * 0.56)}px`;
+      }
     }
 
-    // Interactive wraps stay usable
-    for (const wrap of body.querySelectorAll<HTMLElement>(".iframe-wrap")) {
-      wrap.style.setProperty("width", "100%", "important");
-      wrap.style.setProperty("max-width", "100%", "important");
-      wrap.style.setProperty("margin", "0 auto", "important");
-    }
-
-    // Size iframe to target width for layout, short height to avoid empty %-height
-    const prevCss = iframe.style.cssText;
-    iframe.style.cssText = `position:absolute;left:0;top:0;width:${layoutW}px;height:120px;min-height:0;border:0;`;
-    void root.offsetHeight;
-
-    // Height from full-width media aspect ratios
-    let fromMedia = 0;
     for (const img of body.querySelectorAll("img")) {
       if (!(img instanceof HTMLImageElement)) continue;
-      if (img.naturalWidth > 1 && img.naturalHeight > 1) {
-        fromMedia += (layoutW * img.naturalHeight) / img.naturalWidth;
-      } else if (img.offsetHeight > 8) {
-        fromMedia += img.offsetHeight;
-      }
-    }
-    for (const vid of body.querySelectorAll("video")) {
-      if (!(vid instanceof HTMLVideoElement)) continue;
-      if (vid.videoWidth > 1 && vid.videoHeight > 1) {
-        fromMedia = Math.max(fromMedia, (layoutW * vid.videoHeight) / vid.videoWidth);
-      }
+      img.style.maxWidth = "100%";
+      img.style.height = "auto";
+      img.style.maxHeight = "none";
     }
 
-    let fromRange = 0;
-    try {
-      const range = doc.createRange();
-      range.selectNodeContents(body);
-      fromRange = range.getBoundingClientRect().height;
-    } catch {
-      /* ignore */
+    // Page chrome from the lesson HTML — reduce padding that steals height
+    for (const pageEl of body.querySelectorAll(".page, section.page")) {
+      if (!(pageEl instanceof HTMLElement)) continue;
+      pageEl.style.minHeight = "auto";
+      pageEl.style.padding = "10px";
     }
 
-    let fromChildren = 0;
-    for (const child of Array.from(body.children)) {
-      if (!(child instanceof HTMLElement)) continue;
-      const st = win?.getComputedStyle(child);
-      if (!st || st.display === "none" || st.position === "fixed") continue;
-      fromChildren = Math.max(fromChildren, child.offsetTop + child.offsetHeight);
+    void body.offsetHeight;
+
+    const sw = Math.max(root.scrollWidth, body.scrollWidth, layoutW);
+    let sh = Math.max(root.scrollHeight, body.scrollHeight, 320);
+
+    let stack = 0;
+    for (const el of body.querySelectorAll("img,video,canvas,svg,iframe,.iframe-wrap,.page")) {
+      if (!(el instanceof HTMLElement)) continue;
+      const rect = el.getBoundingClientRect();
+      stack = Math.max(stack, rect.bottom);
+      const natural =
+        el instanceof HTMLImageElement
+          ? el.naturalHeight
+          : el instanceof HTMLVideoElement
+            ? el.videoHeight
+            : 0;
+      if (rect.height < 8 && natural > 8) stack = Math.max(stack, rect.top + natural);
     }
 
-    let fromInteract = 0;
-    const wrap = body.querySelector(".iframe-wrap") as HTMLElement | null;
-    const canvas = body.querySelector("canvas");
-    if (wrap) {
-      fromInteract = Math.max(
-        wrap.offsetHeight,
-        wrap.getBoundingClientRect().height,
-        Math.round(layoutW * 0.56),
-      );
-    } else if (canvas) {
-      fromInteract = Math.max(canvas.getBoundingClientRect().height, Math.round(layoutW * 0.5));
+    // Also account for fixed/absolute labels (page-number, gif-label) that
+    // sit outside the main flow on some interactive pages.
+    for (const el of body.querySelectorAll(".page-number,.gif-label,.tap-to-play")) {
+      if (!(el instanceof HTMLElement)) continue;
+      const rect = el.getBoundingClientRect();
+      stack = Math.max(stack, rect.bottom + 12);
     }
 
-    const hasInteract = !!(wrap || canvas || body.querySelector(".live-frame"));
-    const hasVideo = !!body.querySelector("video");
-    const hasImg = !!body.querySelector("img");
-
-    // Prefer media aspect when page is image/GIF-led (pages 1–2 style)
-    let sh: number;
-    if (hasImg && fromMedia > 40 && !hasInteract) {
-      sh = fromMedia;
-    } else {
-      sh = Math.max(fromRange, fromChildren, fromMedia, fromInteract);
+    const frameH = page.iframe?.getBoundingClientRect().height || page.baseH;
+    if (stack > 8) {
+      const scale = frameH > 8 ? page.baseH / frameH : 1;
+      sh = Math.max(sh, stack * (Number.isFinite(scale) && scale > 0 ? scale : 1));
     }
 
-    const scrollH = Math.max(body.scrollHeight || 0, root.scrollHeight || 0);
-    if (scrollH > sh && scrollH < sh * 1.3) sh = scrollH;
+    // Prefer content width when the HTML is wider than the phone, but keep
+    // a sensible minimum so text does not crush the interactive area.
+    if (sw > layoutW + 48) page.baseW = Math.min(sw, 2400);
+    else page.baseW = layoutW;
 
-    if (hasInteract) sh = Math.max(sh, fromInteract || Math.round(layoutW * 0.56), 200);
-    else if (hasVideo) sh = Math.max(sh, 140);
-    else if (hasImg) sh = Math.max(sh, Math.round(layoutW * 0.25));
-    else sh = Math.max(sh, 60);
-
-    if (!hasInteract) sh = Math.min(sh, layoutW * 2.2);
-    else sh = Math.min(sh, 4200);
-
-    page.baseH = Math.max(48, Math.ceil(sh + 4));
+    // Ensure interactive pages are tall enough that the sim is not clipped
+    const hasInteract = !!body.querySelector(".iframe-wrap, .live-frame, video");
+    const minH = hasInteract ? Math.max(480, interactH + 80) : 400;
+    page.baseH = Math.min(80000, Math.max(minH, Math.ceil(sh + 32)));
     this.ensureTiles(page);
 
-    iframe.style.cssText = prevCss || "";
-    iframe.style.position = "absolute";
-    iframe.style.left = "0";
-    iframe.style.top = "0";
-    iframe.style.width = "100%";
-    iframe.style.height = "100%";
-    iframe.style.minHeight = "0";
-    iframe.style.border = "0";
-    iframe.style.touchAction = "auto";
+    // Size the iframe itself to fill the page so touches hit the content
+    if (page.iframe) {
+      page.iframe.style.position = "absolute";
+      page.iframe.style.left = "0";
+      page.iframe.style.top = "0";
+      page.iframe.style.width = "100%";
+      page.iframe.style.height = "100%";
+      page.iframe.style.border = "0";
+      page.iframe.style.touchAction = "auto";
+    }
   }
-
 
   private watchHtml() {
     this.htmlObserver?.disconnect();
     if (this.doc?.kind !== "html") return;
-    // One-shot remeasure after images load — do not keep observing in a way
-    // that re-inflates page height (that caused huge empty regions).
     this.htmlObserver = new ResizeObserver(() => {
-      if (this.doc?.kind !== "html" || this.mode === "pinch") return;
-      window.clearTimeout(this.resizeT);
-      this.resizeT = window.setTimeout(() => {
-        if (!this.alive || this.doc?.kind !== "html" || this.mode === "pinch") return;
-        let changed = false;
-        for (const page of this.doc.pages) {
-          if (!page.iframe?.contentDocument?.body) continue;
-          const prev = page.baseH;
-          this.measureHtml(page, page.baseW || this.htmlLayoutW || this.availableWidth());
-          // Only accept shrink or modest growth (image finished loading)
-          if (page.baseH > prev + 80) {
-            // Reject large growth — keep previous tight height
-            page.baseH = prev;
-            this.ensureTiles(page);
-          } else if (Math.abs(page.baseH - prev) > 12) {
-            changed = true;
-          }
+      if (this.doc?.kind !== "html") return;
+      // Never reflow while pinching — this was freezing zoom on large HTML
+      if (this.mode === "pinch") return;
+      let grew = false;
+      for (const page of this.doc.pages) {
+        const doc = page.iframe?.contentDocument;
+        if (!doc) continue;
+        const sh = Math.max(doc.documentElement.scrollHeight, doc.body?.scrollHeight ?? 0);
+        const next = Math.min(80000, Math.max(page.baseH, sh));
+        if (next > page.baseH + 24) {
+          page.baseH = next;
+          this.ensureTiles(page);
+          grew = true;
         }
-        if (changed) {
-          this.layout();
-          this.mountVisible(false);
-        }
-      }, 200);
+      }
+      if (grew) {
+        this.layout();
+        this.mountVisible(false);
+      }
     });
     for (const page of this.doc.pages) {
       const body = page.iframe?.contentDocument?.body;
@@ -1573,14 +1443,11 @@ export class Engine {
     inner.className = "page-inner";
     const fill = document.createElement("div");
     fill.className = "page-fill";
-    fill.style.background = "transparent";
-    fill.style.color = "transparent";
-    fill.textContent = "";
+    fill.textContent = `Page ${index}`;
     const mediaLayer = document.createElement("div");
     mediaLayer.className = "media-layer";
     const tilesHost = document.createElement("div");
     tilesHost.className = "tiles-host";
-    // Ink must not block video controls / HTML hits underneath
     tilesHost.style.pointerEvents = "none";
     mediaLayer.style.pointerEvents = "auto";
     inner.append(fill, mediaLayer, tilesHost);
@@ -1632,7 +1499,6 @@ export class Engine {
 
   private clearDoc() {
     this.thumbToken++;
-    this.closeContentFullscreen();
     this.htmlObserver?.disconnect();
     this.htmlObserver = null;
     this.clearVideoFocus();
@@ -1659,12 +1525,7 @@ export class Engine {
   }
 
   private availableWidth() {
-    // Use nearly the full desktop viewer width
-    return Math.max(220, this.els.scroll.clientWidth - 4);
-  }
-
-  private availableHeight() {
-    return Math.max(180, this.els.scroll.clientHeight - 4);
+    return Math.max(220, this.els.scroll.clientWidth - 24);
   }
 
   private displayScale() {
@@ -1675,43 +1536,17 @@ export class Engine {
   private layout() {
     if (!this.doc) return;
     this.lastAvail = this.availableWidth();
-    let S = this.displayScale();
-    // Snap tiny floating error so 100% stays crystal-sharp (no CSS scale)
-    if (Math.abs(S - 1) < 0.02) S = 1;
+    const S = this.displayScale();
     this.applyChromeSpace();
     for (const page of this.doc.pages) {
       const w = page.baseW * S;
       const h = page.baseH * S;
       page.shell.style.width = `${w}px`;
       page.shell.style.height = `${h}px`;
-      page.shell.style.maxWidth = "100%";
-      page.shell.style.marginLeft = "auto";
-      page.shell.style.marginRight = "auto";
-      // Always keep inner at base pixel size; scale with transform when zoom ≠ 100%.
-      // At 100% transform is none → HTML canvas stays sharp.
       page.inner.style.width = `${page.baseW}px`;
       page.inner.style.height = `${page.baseH}px`;
-      page.inner.style.transformOrigin = "0 0";
-      page.inner.style.transform = S === 1 ? "none" : `scale(${S})`;
+      page.inner.style.transform = `scale(${S})`;
       page.inner.style.setProperty("--page-scale", String(S));
-      if (page.iframe) {
-        page.iframe.style.width = "100%";
-        page.iframe.style.height = "100%";
-        page.iframe.style.transform = "none";
-      }
-      // Reset any one-off ink/media transforms from older builds
-      if (page.tilesHost) {
-        page.tilesHost.style.transform = "";
-        page.tilesHost.style.width = "";
-        page.tilesHost.style.height = "";
-        page.tilesHost.style.pointerEvents = "none";
-      }
-      if (page.mediaLayer) {
-        page.mediaLayer.style.transform = "";
-        page.mediaLayer.style.width = "";
-        page.mediaLayer.style.height = "";
-        page.mediaLayer.style.pointerEvents = "auto";
-      }
     }
     if (Math.abs(this.visualRatio - 1) < 0.001) {
       this.els.stage.style.transform = "";
@@ -1722,135 +1557,9 @@ export class Engine {
   }
 
   private applyChromeSpace() {
-    const stage = this.els.stage;
-    stage.style.setProperty("display", "block", "important");
-    stage.style.setProperty("padding", "0", "important");
-    stage.style.setProperty("gap", "0", "important");
-    stage.style.setProperty("row-gap", "0", "important");
-    stage.style.setProperty("column-gap", "0", "important");
-    stage.style.setProperty("width", "100%", "important");
-    const pages = this.doc?.pages ?? [];
-    pages.forEach((page, i) => {
-      page.shell.style.setProperty("display", "block", "important");
-      page.shell.style.setProperty("padding", "0", "important");
-      page.shell.style.setProperty("max-width", "100%", "important");
-      const mb = i < pages.length - 1 ? "4px" : "0";
-      page.shell.style.setProperty("margin", `0 auto ${mb} auto`, "important");
-    });
-  }
-
-  private ensureGapStyle() {
-    for (const id of ["teachpdf-gap-fix", "teachpdf-gap-fix-v2", "teachpdf-gap-fix-v3"]) {
-      document.getElementById(id)?.remove();
-    }
-    const s = document.createElement("style");
-    s.id = "teachpdf-gap-fix-v3";
-    s.textContent = `
-      .teach-stage {
-        display: block !important;
-        gap: 0 !important;
-        row-gap: 0 !important;
-        column-gap: 0 !important;
-        padding: 2px !important;
-      }
-      .page-shell {
-        display: block !important;
-        margin-left: auto !important;
-        margin-right: auto !important;
-        margin-top: 0 !important;
-        padding: 0 !important;
-      }
-      .page-inner { margin: 0 !important; padding: 0 !important; }
-      .page-fill { background: transparent !important; color: transparent !important; }
-      .tiles-host { pointer-events: none !important; }
-      .media-item video, .html-frame video {
-        pointer-events: auto !important;
-        touch-action: manipulation !important;
-      }
-      /* Scrollbar hidden until pointer is on the right edge */
-      .teach-scroll {
-        scrollbar-width: thin;
-        scrollbar-color: transparent transparent;
-      }
-      .teach-scroll:hover,
-      .teach-scroll.is-scroll-hover {
-        scrollbar-color: rgba(100,116,139,0.7) transparent;
-      }
-      .teach-scroll::-webkit-scrollbar { width: 10px; background: transparent; }
-      .teach-scroll::-webkit-scrollbar-thumb {
-        background: transparent;
-        border-radius: 8px;
-      }
-      .teach-scroll:hover::-webkit-scrollbar-thumb,
-      .teach-scroll.is-scroll-hover::-webkit-scrollbar-thumb {
-        background: rgba(100,116,139,0.65);
-      }
-      /* Fullscreen content button on each page */
-      .teach-content-fs {
-        position: absolute;
-        right: 10px;
-        bottom: 10px;
-        z-index: 50;
-        width: 40px;
-        height: 40px;
-        border: none;
-        border-radius: 10px;
-        background: rgba(15,23,42,0.82);
-        color: #e2e8f0;
-        font-size: 18px;
-        cursor: pointer;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        pointer-events: auto;
-        box-shadow: 0 2px 10px rgba(0,0,0,0.35);
-      }
-      .teach-content-fs:hover { background: rgba(15,23,42,0.95); }
-      .teach-content-overlay {
-        position: fixed !important;
-        inset: 0 !important;
-        top: 0 !important; right: 0 !important; bottom: 0 !important; left: 0 !important;
-        z-index: 99999 !important;
-        margin: 0 !important;
-        padding: 0 !important;
-        background: #000 !important;
-        border: none !important;
-        width: 100vw !important;
-        height: 100vh !important;
-        max-width: 100vw !important;
-        max-height: 100vh !important;
-        overflow: hidden !important;
-      }
-      .teach-content-overlay iframe,
-      .teach-content-overlay video {
-        position: absolute !important;
-        inset: 0 !important;
-        width: 100% !important;
-        height: 100% !important;
-        border: 0 !important;
-        margin: 0 !important;
-        padding: 0 !important;
-        background: #000 !important;
-        max-width: none !important;
-        max-height: none !important;
-      }
-      .teach-content-overlay-bar {
-        position: absolute;
-        top: 12px;
-        right: 12px;
-        z-index: 2;
-      }
-      .teach-content-overlay-bar button {
-        border: none;
-        border-radius: 10px;
-        padding: 10px 16px;
-        background: rgba(15,23,42,0.88);
-        color: #fff;
-        font: 14px system-ui,sans-serif;
-        cursor: pointer;
-      }
-    `;
-    document.head.appendChild(s);
+    const pad = 12 / this.visualRatio;
+    this.els.stage.style.padding = `${pad}px`;
+    this.els.stage.style.gap = `${pad}px`;
   }
 
   private applyTransform() {
@@ -1888,8 +1597,8 @@ export class Engine {
 
   private zoomAt(next: number, clientX: number, clientY: number) {
     if (!this.doc) return;
-    next = clamp(Math.round(next * 10) / 10, MIN_Z, MAX_Z);
-    const old = Math.max(0.05, this.committedZoom);
+    next = clamp(next, MIN_Z, MAX_Z);
+    const old = this.committedZoom;
     if (Math.abs(next - old) < 0.001) {
       this.hooks.onZoom(this.userZoom);
       return;
@@ -1904,15 +1613,9 @@ export class Engine {
     this.userZoom = next;
     this.committedZoom = next;
     this.visualRatio = 1;
-    this.els.stage.style.transform = "";
-    this.els.stage.classList.remove("is-pinching");
-    try {
-      this.layout();
-      scroll.scrollLeft = Math.max(0, layoutX * applied - ox);
-      scroll.scrollTop = Math.max(0, layoutY * applied - oy);
-    } catch {
-      /* ignore layout errors */
-    }
+    this.layout();
+    scroll.scrollLeft = layoutX * applied - ox;
+    scroll.scrollTop = layoutY * applied - oy;
     this.mountVisible(true);
     this.hooks.onZoom(next);
     this.patch({ zoom: next });
@@ -1921,27 +1624,21 @@ export class Engine {
 
   private commitZoom() {
     if (!this.doc) return;
-    const R = this.visualRatio || 1;
+    const R = this.visualRatio;
     if (Math.abs(this.userZoom - this.committedZoom) < 0.001 && Math.abs(R - 1) < 0.001) return;
     const scroll = this.els.scroll;
     const rect = scroll.getBoundingClientRect();
     const ox = rect.width / 2;
     const oy = rect.height / 2;
-    const safeR = Math.max(0.05, R);
-    const layoutX = (scroll.scrollLeft + ox) / safeR;
-    const layoutY = (scroll.scrollTop + oy) / safeR;
-    const applied = this.userZoom / Math.max(0.05, this.committedZoom);
+    const layoutX = (scroll.scrollLeft + ox) / R;
+    const layoutY = (scroll.scrollTop + oy) / R;
+    const applied = this.userZoom / this.committedZoom;
     this.committedZoom = this.userZoom;
     this.visualRatio = 1;
+    this.layout();
+    scroll.scrollLeft = layoutX * applied - ox;
+    scroll.scrollTop = layoutY * applied - oy;
     this.els.stage.classList.remove("is-pinching");
-    this.els.stage.style.transform = "";
-    try {
-      this.layout();
-      scroll.scrollLeft = Math.max(0, layoutX * applied - ox);
-      scroll.scrollTop = Math.max(0, layoutY * applied - oy);
-    } catch {
-      /* keep UI alive if a page layout throws */
-    }
     this.mountVisible(true);
     this.hooks.onZoom(this.userZoom);
     this.patch({ zoom: this.userZoom });
@@ -2003,7 +1700,6 @@ export class Engine {
       void this.renderPdf(page);
     }
     this.syncTiles(page, force);
-    this.ensureContentFsButton(page);
   }
 
   private unmountPage(page: Page) {
@@ -2276,14 +1972,7 @@ export class Engine {
       video.controls = true;
       video.playsInline = true;
       video.setAttribute("playsinline", "");
-      video.setAttribute("webkit-playsinline", "");
-      video.setAttribute("controls", "true");
       video.preload = "metadata";
-      video.style.width = "100%";
-      video.style.height = "100%";
-      video.style.objectFit = "contain";
-      video.style.pointerEvents = "auto";
-      video.style.touchAction = "manipulation";
       el.appendChild(video);
     } else {
       const img = document.createElement("img");
@@ -2372,46 +2061,6 @@ export class Engine {
     if (event.pointerType === "mouse" && event.button !== 0) {
       if (!(toolNow === "laser" && event.button === 2)) return;
     }
-
-    // ===== VIDEO / HTML NATIVE CLICK (Hand tool) =====
-    // Must run BEFORE pointers / capture so the browser delivers the click
-    // to <video controls> and iframe content (play, scrub, pause).
-    if (toolNow === "hand" && event.button === 0) {
-      const t = event.target;
-      // Direct hit on media-layer video
-      if (t instanceof HTMLVideoElement) {
-        t.controls = true;
-        t.style.pointerEvents = "auto";
-        this.videoFocus = true;
-        this.patch({ video: true });
-        return;
-      }
-      if (t instanceof Element) {
-        const mediaVideo = t.closest(".media-item")?.querySelector("video");
-        if (mediaVideo instanceof HTMLVideoElement) {
-          mediaVideo.controls = true;
-          mediaVideo.style.pointerEvents = "auto";
-          this.videoFocus = true;
-          this.patch({ video: true });
-          return;
-        }
-        // Click landed on the iframe element itself → native pass-through
-        if (t instanceof HTMLIFrameElement || t.closest("iframe.html-frame, iframe")) {
-          const page = this.pageAt(event.clientX, event.clientY);
-          if (page?.iframe) {
-            this.tryInteractHtml(event.clientX, event.clientY);
-            this.htmlHandPending = {
-              x: event.clientX,
-              y: event.clientY,
-              pointerId: event.pointerId,
-              page,
-            };
-          }
-          return;
-        }
-      }
-    }
-
     this.pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
     const capture = () => {
       try {
@@ -2473,14 +2122,6 @@ export class Engine {
       capture();
       return;
     }
-    // Selected media handles (resize/rotate) always drag
-    if (hit && hit.mode && hit.isHandle && this.selectedMediaId === hit.media.id) {
-      this.beginMedia(hit, event, hit.mode);
-      event.preventDefault();
-      capture();
-      return;
-    }
-
     if (
       hit &&
       hit.mode === "move" &&
@@ -2493,6 +2134,22 @@ export class Engine {
       capture();
       return;
     }
+    // Hand + video media: native controls (no drag)
+    if (hit && prefs.tool === "hand" && hit.media.kind === "video") {
+      const video = hit.el.querySelector("video");
+      if (video instanceof HTMLVideoElement) {
+        video.controls = true;
+        video.setAttribute("playsinline", "");
+        video.setAttribute("webkit-playsinline", "");
+        video.style.pointerEvents = "auto";
+        video.style.touchAction = "manipulation";
+        this.videoFocus = true;
+        this.patch({ video: true });
+        this.say("Video ready – use the controls");
+        return;
+      }
+    }
+
     if (hit && prefs.tool === "hand" && hit.media.kind === "image") {
       this.selectMedia(hit.media.id);
       this.beginMedia(hit, event, "move");
@@ -2502,47 +2159,14 @@ export class Engine {
     }
 
     if (prefs.tool === "hand") {
-      // --- Native video / interactive pass-through (do not steal the click) ---
-      // 1) Media-layer video: let the <video controls> receive the event
-      if (hit && hit.media.kind === "video") {
-        const video = hit.el.querySelector("video");
-        if (video instanceof HTMLVideoElement) {
-          video.controls = true;
-          video.setAttribute("playsinline", "");
-          video.setAttribute("webkit-playsinline", "");
-          video.style.pointerEvents = "auto";
-          video.style.touchAction = "manipulation";
-          this.videoFocus = true;
-          this.patch({ video: true });
-          // NO preventDefault, NO capture, NO video.play() — native controls work
-          return;
-        }
+      // Prefer letting video controls and interactive HTML receive the touch.
+      // Only start a pan when the touch is clearly on empty page chrome.
+      const interacted = this.tryInteractHtml(event.clientX, event.clientY);
+      if (interacted) {
+        // Do not preventDefault / setPointerCapture – the browser must
+        // deliver this gesture to the <video> or nested interactive page.
+        return;
       }
-
-      // 2) HTML iframe: unlock interact / detect video, then let native UI handle
-      const page = this.pageAt(event.clientX, event.clientY);
-      if (page?.iframe) {
-        const ir = page.iframe.getBoundingClientRect();
-        const overIframe =
-          event.clientX >= ir.left &&
-          event.clientX <= ir.right &&
-          event.clientY >= ir.top &&
-          event.clientY <= ir.bottom;
-        if (overIframe) {
-          // Prepare interact / video attributes but do not steal the pointer
-          this.tryInteractHtml(event.clientX, event.clientY);
-          this.htmlHandPending = {
-            x: event.clientX,
-            y: event.clientY,
-            pointerId: event.pointerId,
-            page,
-          };
-          // Critical: no preventDefault / no setPointerCapture
-          return;
-        }
-      }
-
-      this.htmlHandPending = null;
       this.beginPan(event);
       event.preventDefault();
       capture();
@@ -2633,36 +2257,6 @@ export class Engine {
       tracked.x = event.clientX;
       tracked.y = event.clientY;
     }
-    // Hand on HTML: convert to pan once the user actually drags
-    // Skip while video controls are active so scrubbing the timeline is not stolen
-    if (
-      this.htmlHandPending &&
-      this.htmlHandPending.pointerId === event.pointerId &&
-      !this.videoFocus
-    ) {
-      const dx = event.clientX - this.htmlHandPending.x;
-      const dy = event.clientY - this.htmlHandPending.y;
-      if (Math.hypot(dx, dy) > 10) {
-        const startX = this.htmlHandPending.x;
-        const startY = this.htmlHandPending.y;
-        this.htmlHandPending = null;
-        this.mode = "pan";
-        this.panX = startX;
-        this.panY = startY;
-        this.panT = performance.now();
-        this.panMoved = 0;
-        this.panVx = 0;
-        this.panVy = 0;
-        try {
-          this.els.scroll.setPointerCapture(event.pointerId);
-        } catch {
-          /* ignore */
-        }
-        event.preventDefault();
-        this.movePan(event);
-        return;
-      }
-    }
     if (this.mode === "pinch" && this.pointers.size >= 2) {
       event.preventDefault();
       this.movePinch();
@@ -2721,7 +2315,6 @@ export class Engine {
     }
     if (this.pointers.size > 0) return;
     this.blockUntilUp = false;
-    this.htmlHandPending = null;
     this.clearHoldPan();
     if (this.mode === "pan") this.finishPan(event);
     else if (this.mode === "draw") this.finishDraw();
@@ -2788,15 +2381,6 @@ export class Engine {
     if (event.pointerType === "mouse" && this.hooks.getPrefs().tool === "laser") {
       this.hideLaser();
     }
-    this.els.scroll.classList.remove("is-scroll-hover");
-  };
-
-  /** Show scrollbar only when the pointer is near the right edge. */
-  private onScrollEdgeHover = (event: PointerEvent) => {
-    if (event.pointerType !== "mouse") return;
-    const r = this.els.scroll.getBoundingClientRect();
-    const nearRight = event.clientX >= r.right - 18;
-    this.els.scroll.classList.toggle("is-scroll-hover", nearRight);
   };
 
   private blockGesture = (event: Event) => {
@@ -3197,205 +2781,6 @@ export class Engine {
     this.laser.style.display = "none";
   }
 
-  /** Attach bottom-right fullscreen button on HTML / video pages. */
-  private ensureContentFsButton(page: Page) {
-    if (page.shell.querySelector(".teach-content-fs")) return;
-    const hasHtml = !!page.iframe;
-    const hasVideoMedia = page.media.some((m) => m.kind === "video");
-    if (!hasHtml && !hasVideoMedia) return;
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "teach-content-fs";
-    btn.title = "Open content fullscreen";
-    btn.setAttribute("aria-label", "Open content fullscreen");
-    btn.textContent = "⛶";
-    btn.addEventListener("pointerdown", (e) => {
-      e.stopPropagation();
-      e.preventDefault();
-    });
-    btn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      e.preventDefault();
-      this.openContentFullscreen(page);
-    });
-    page.shell.style.position = "relative";
-    page.shell.appendChild(btn);
-  }
-
-  /** Fullscreen overlay: only the interactive HTML or video, nothing else. */
-  openContentFullscreen(page?: Page) {
-    const p = page || this.currentPage();
-    if (!p) {
-      this.say("Open a page first");
-      return;
-    }
-    this.closeContentFullscreen();
-
-    const overlay = document.createElement("div");
-    overlay.className = "teach-content-overlay";
-    overlay.style.cssText =
-      "position:fixed;inset:0;z-index:99999;margin:0;padding:0;background:#000;width:100vw;height:100vh;overflow:hidden;";
-    const bar = document.createElement("div");
-    bar.className = "teach-content-overlay-bar";
-    const closeBtn = document.createElement("button");
-    closeBtn.type = "button";
-    closeBtn.textContent = "Exit fullscreen";
-    closeBtn.addEventListener("click", () => this.closeContentFullscreen());
-    bar.appendChild(closeBtn);
-    overlay.appendChild(bar);
-
-    // Prefer HTML iframe lesson
-    if (p.iframe) {
-      const src =
-        p.iframe.dataset.src ||
-        p.iframe.getAttribute("src") ||
-        p.iframe.src ||
-        "";
-      const frame = document.createElement("iframe");
-      frame.setAttribute(
-        "sandbox",
-        "allow-scripts allow-same-origin allow-forms allow-popups allow-presentation",
-      );
-      frame.setAttribute("allow", "autoplay; fullscreen; picture-in-picture");
-      frame.style.cssText =
-        "position:absolute;inset:0;width:100%;height:100%;border:0;margin:0;padding:0;background:#000;";
-      frame.src = src;
-      // Auto-unlock interactive content after load
-      frame.addEventListener("load", () => {
-        try {
-          const doc = frame.contentDocument;
-          if (!doc) return;
-          for (const live of doc.querySelectorAll<HTMLIFrameElement>(".live-frame, iframe[data-src]")) {
-            const s = live.getAttribute("data-src") || live.dataset.src || "";
-            if (s && !live.dataset.loaded) {
-              live.src = s;
-              live.dataset.loaded = "1";
-            }
-          }
-          for (const btn of doc.querySelectorAll<HTMLElement>(".tap-to-play")) {
-            btn.classList.add("hidden");
-            try {
-              btn.click();
-            } catch {
-              /* ignore */
-            }
-          }
-          for (const v of doc.querySelectorAll("video")) {
-            v.setAttribute("controls", "true");
-            v.setAttribute("playsinline", "");
-            (v as HTMLVideoElement).controls = true;
-          }
-        } catch {
-          /* ignore */
-        }
-      });
-      overlay.appendChild(frame);
-    } else {
-      const vidMedia = p.media.find((m) => m.kind === "video");
-      if (vidMedia) {
-        const video = document.createElement("video");
-        video.src = vidMedia.src;
-        video.controls = true;
-        video.autoplay = true;
-        video.playsInline = true;
-        video.setAttribute("playsinline", "");
-        overlay.appendChild(video);
-        void video.play().catch(() => {
-          /* controls available */
-        });
-      } else {
-        this.say("No interactive content on this page");
-        return;
-      }
-    }
-
-    document.body.appendChild(overlay);
-    this.contentOverlay = overlay;
-    const onKey = (ev: KeyboardEvent) => {
-      if (ev.key === "Escape") this.closeContentFullscreen();
-    };
-    window.addEventListener("keydown", onKey);
-    (overlay as HTMLDivElement & { _onKey?: (e: KeyboardEvent) => void })._onKey = onKey;
-    this.say("Content fullscreen — press Esc to exit");
-  }
-
-  closeContentFullscreen() {
-    const overlay = this.contentOverlay;
-    if (!overlay) return;
-    const onKey = (overlay as HTMLDivElement & { _onKey?: (e: KeyboardEvent) => void })._onKey;
-    if (onKey) window.removeEventListener("keydown", onKey);
-    overlay.remove();
-    this.contentOverlay = null;
-  }
-
-  /** Hit-test videos by viewport box (works with native control bar on desktop). */
-  private videoAtPoint(doc: Document, x: number, y: number): HTMLVideoElement | null {
-    for (const node of doc.querySelectorAll("video")) {
-      if (!(node instanceof HTMLVideoElement)) continue;
-      const r = node.getBoundingClientRect();
-      // Include a few px under the box for the control bar on some browsers
-      if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom + 6) return node;
-    }
-    return null;
-  }
-
-  private unlockVideo(video: HTMLVideoElement, iframe?: HTMLIFrameElement | null) {
-    // Only arm native controls — do NOT play/pause here.
-    // The real click must reach the <video> so the browser allows control UI.
-    video.setAttribute("playsinline", "");
-    video.setAttribute("webkit-playsinline", "");
-    video.setAttribute("controls", "true");
-    video.controls = true;
-    video.style.pointerEvents = "auto";
-    video.style.touchAction = "manipulation";
-    if (iframe) {
-      iframe.style.pointerEvents = "auto";
-      iframe.style.touchAction = "auto";
-      iframe.classList.add("is-live");
-    }
-    this.videoFocus = true;
-    this.patch({ video: true });
-    this.say("Video controls ready");
-  }
-
-  private unlockInteractive(page: Page, iframe: HTMLIFrameElement, tapBtn?: HTMLElement | null) {
-    const doc = iframe.contentDocument;
-    const root = tapBtn?.closest(".iframe-wrap") || doc;
-    if (root) {
-      for (const live of root.querySelectorAll<HTMLIFrameElement>(".live-frame, iframe[data-src]")) {
-        const src = live.getAttribute("data-src") || live.dataset.src || live.getAttribute("src") || "";
-        if (src && (!live.dataset.loaded || live.getAttribute("src") !== src)) {
-          live.src = src;
-          live.dataset.loaded = "1";
-        }
-        try {
-          live.focus();
-        } catch {
-          /* ignore */
-        }
-      }
-    }
-    if (tapBtn) {
-      tapBtn.classList.add("hidden");
-      try {
-        tapBtn.click();
-      } catch {
-        /* ignore */
-      }
-    }
-    // Hide any other overlays on the page
-    doc?.querySelectorAll(".tap-to-play").forEach((b) => b.classList.add("hidden"));
-    iframe.classList.add("is-live");
-    iframe.style.pointerEvents = "auto";
-    iframe.style.touchAction = "auto";
-    this.say("Interactive page unlocked");
-    window.setTimeout(() => {
-      if (!this.alive || !page.shell.isConnected) return;
-      this.measureHtml(page, page.baseW);
-      this.layout();
-    }, 400);
-  }
-
   /** Returns true if the touch should be left for the HTML content (no pan/capture). */
   private tryInteractHtml(x: number, y: number): boolean {
     const page = this.pageAt(x, y);
@@ -3405,14 +2790,6 @@ export class Engine {
 
     const rect = iframe.getBoundingClientRect();
     if (rect.width < 2 || rect.height < 2) return false;
-    if (x < rect.left || x > rect.right || y < rect.top || y > rect.bottom) return false;
-
-    // Prefer geometry hit-test so native video control bar clicks work on desktop
-    const byBox = this.videoAtPoint(doc, x, y);
-    if (byBox) {
-      this.unlockVideo(byBox, iframe);
-      return true;
-    }
 
     const ix = ((x - rect.left) / rect.width) * iframe.clientWidth;
     const iy = ((y - rect.top) / rect.height) * iframe.clientHeight;
@@ -3423,69 +2800,84 @@ export class Engine {
     } catch {
       return false;
     }
-    if (!el) {
-      // Over iframe but no element — still don't steal if video focus
-      return this.videoFocus;
-    }
+    if (!el) return false;
 
+    // While video is focused, only pass through when the finger is still on a video
     if (this.videoFocus) {
-      if (el.closest("video") || this.videoAtPoint(doc, x, y)) return true;
+      if (el.closest("video")) return true;
+      // Tapped outside the video → exit video mode so pan works again
       this.clearVideoFocus();
       return false;
     }
 
-    // 1. Real <video> via DOM walk
+    // 1. Real <video>
     const video = el.closest("video");
     if (video instanceof HTMLVideoElement) {
-      this.unlockVideo(video, iframe);
-      return true;
-    }
+      video.setAttribute("playsinline", "");
+      video.setAttribute("webkit-playsinline", "");
+      video.setAttribute("controls", "true");
+      video.controls = true;
+      video.style.pointerEvents = "auto";
+      video.style.touchAction = "manipulation";
+      video.style.maxWidth = "100%";
+      video.style.width = "100%";
+      video.style.height = "auto";
 
-    // 2. "Tap to interact" — DOM walk OR geometry (button often sits above a canvas)
-    let tapBtn = el.closest(".tap-to-play") as HTMLElement | null;
-    if (!tapBtn) {
-      for (const node of doc.querySelectorAll(".tap-to-play")) {
-        if (!(node instanceof HTMLElement)) continue;
-        if (node.classList.contains("hidden")) continue;
-        const r = node.getBoundingClientRect();
-        if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) {
-          tapBtn = node;
-          break;
+      // Make sure nothing in our page shell sits above the video
+      iframe.style.pointerEvents = "auto";
+      iframe.style.touchAction = "auto";
+      iframe.classList.add("is-live");
+
+      this.videoFocus = true;
+      this.patch({ video: true });
+      this.say("Video ready – use the controls");
+
+      // Focus so mobile browsers treat later taps as media gestures
+      try {
+        video.focus({ preventScroll: true });
+      } catch {
+        try {
+          video.focus();
+        } catch {
+          /* ignore */
         }
       }
-    }
-    // Also: click anywhere on .iframe-wrap unlocks if a tap-to-play exists there
-    if (!tapBtn) {
-      const wrap = el.closest(".iframe-wrap") as HTMLElement | null;
-      const candidate = wrap?.querySelector(".tap-to-play:not(.hidden)") as HTMLElement | null;
-      if (candidate) tapBtn = candidate;
-    }
-    if (tapBtn) {
-      this.unlockInteractive(page, iframe, tapBtn);
       return true;
     }
 
-    // 2b. Any unloaded live-frame under the point → load it
-    const wrapHit = el.closest(".iframe-wrap") as HTMLElement | null;
-    if (wrapHit) {
-      const live = wrapHit.querySelector(".live-frame, iframe[data-src]") as HTMLIFrameElement | null;
+    // 2. "Tap to interact" button (works again after scrolling away and back)
+    const tapBtn = el.closest(".tap-to-play") as HTMLElement | null;
+    if (tapBtn) {
+      const wrap = tapBtn.closest(".iframe-wrap");
+      const live = wrap?.querySelector(".live-frame") as HTMLIFrameElement | null;
       if (live) {
-        const src = live.getAttribute("data-src") || live.dataset.src || live.getAttribute("src") || "";
-        if (src && !live.dataset.loaded) {
+        const src = live.getAttribute("data-src") || live.getAttribute("src") || live.dataset.src || "";
+        if (src && (live.getAttribute("src") !== src || !live.dataset.loaded)) {
           live.src = src;
           live.dataset.loaded = "1";
-          wrapHit.querySelector(".tap-to-play")?.classList.add("hidden");
-          iframe.classList.add("is-live");
-          iframe.style.pointerEvents = "auto";
-          this.say("Interactive page unlocked");
-          window.setTimeout(() => {
-            if (!this.alive || !page.shell.isConnected) return;
-            this.measureHtml(page, page.baseW);
-            this.layout();
-          }, 400);
-          return true;
+        }
+        tapBtn.classList.add("hidden");
+        try {
+          live.focus();
+        } catch {
+          /* ignore */
         }
       }
+      try {
+        tapBtn.click();
+      } catch {
+        /* ignore */
+      }
+      iframe.classList.add("is-live");
+      iframe.style.pointerEvents = "auto";
+      iframe.style.touchAction = "auto";
+      this.say("Interactive page unlocked");
+      window.setTimeout(() => {
+        if (!this.alive || !page.shell.isConnected) return;
+        this.measureHtml(page, page.baseW);
+        this.layout();
+      }, 400);
+      return true;
     }
 
     // 3. Buttons / links
