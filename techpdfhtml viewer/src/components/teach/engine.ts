@@ -859,6 +859,13 @@ export class Engine {
       if (i % 2 === 1) await yieldThread();
     }
     if (gen !== this.docGen || !this.alive) return;
+    // Second pass after images decode — fixes too-short pages
+    await yieldThread();
+    for (let i = 0; i < pages.length; i++) {
+      if (gen !== this.docGen || !this.alive) return;
+      if (!pages[i].iframe?.src) continue;
+      this.measureHtml(pages[i], layoutW);
+    }
     this.watchHtml();
     this.layout();
     this.mountVisible(true);
@@ -1322,13 +1329,14 @@ export class Engine {
     const doc = iframe?.contentDocument;
     if (!iframe || !doc?.body) {
       page.baseW = layoutW;
-      page.baseH = Math.round(layoutW * 0.5);
+      page.baseH = Math.round(layoutW * 0.65);
       this.ensureTiles(page);
       return;
     }
     const body = doc.body;
     const root = doc.documentElement;
     const win = doc.defaultView;
+    page.baseW = layoutW;
 
     for (const vid of body.querySelectorAll("video")) {
       if (!(vid instanceof HTMLVideoElement)) continue;
@@ -1336,6 +1344,7 @@ export class Engine {
       vid.setAttribute("playsinline", "");
       vid.setAttribute("webkit-playsinline", "");
       vid.style.maxWidth = "100%";
+      vid.style.width = "100%";
       vid.style.height = "auto";
       vid.style.pointerEvents = "auto";
     }
@@ -1343,81 +1352,111 @@ export class Engine {
       if (!(img instanceof HTMLImageElement)) continue;
       img.style.maxWidth = "100%";
       img.style.height = "auto";
+      img.style.display = "block";
     }
 
-    // Strip fill-the-viewport rules from the lesson
-    const strip = (el: HTMLElement) => {
+    // Remove viewport-filling min-heights from the lesson
+    const stripMin = (el: HTMLElement) => {
       el.style.setProperty("min-height", "0", "important");
-      el.style.setProperty("height", "auto", "important");
     };
-    strip(root);
-    strip(body);
+    stripMin(root);
+    stripMin(body);
     body.style.setProperty("margin", "0", "important");
+    body.style.setProperty("height", "auto", "important");
+    root.style.setProperty("height", "auto", "important");
     for (const el of body.querySelectorAll<HTMLElement>(
-      ".page,.pdf-page,.slide,section.page,[data-page],main,article,header,footer",
+      ".page,.pdf-page,.slide,section.page,[data-page],main,article",
     )) {
-      el.style.setProperty("min-height", "0", "important");
+      stripMin(el);
+      el.style.setProperty("height", "auto", "important");
     }
 
-    // Collapse iframe so % heights inside the lesson resolve against ~0, not a tall shell
-    iframe.style.height = "0px";
-    iframe.style.minHeight = "0px";
+    // Give the iframe a real WIDTH so images/% widths compute, but a
+    // modest HEIGHT so 100%-tall children cannot invent empty space.
+    const prevCss = iframe.style.cssText;
+    iframe.style.cssText = `position:absolute;left:0;top:0;width:${layoutW}px;height:80px;min-height:0;border:0;visibility:visible;`;
     void root.offsetHeight;
 
-    // Most reliable content height: bounding range of body contents
-    let sh = 0;
+    // Height from natural image/video aspect (works even if not fully laid out)
+    let fromMedia = 0;
+    for (const img of body.querySelectorAll("img")) {
+      if (!(img instanceof HTMLImageElement)) continue;
+      if (img.naturalWidth > 0 && img.naturalHeight > 0) {
+        fromMedia += (layoutW * img.naturalHeight) / img.naturalWidth;
+      } else if (img.offsetHeight > 0) {
+        fromMedia += img.offsetHeight;
+      }
+    }
+    for (const vid of body.querySelectorAll("video")) {
+      if (!(vid instanceof HTMLVideoElement)) continue;
+      if (vid.videoWidth > 0 && vid.videoHeight > 0) {
+        fromMedia = Math.max(
+          fromMedia,
+          (layoutW * vid.videoHeight) / vid.videoWidth,
+        );
+      }
+    }
+
+    // Content range height
+    let fromRange = 0;
     try {
       const range = doc.createRange();
       range.selectNodeContents(body);
-      const rect = range.getBoundingClientRect();
-      sh = Math.ceil(rect.height);
+      fromRange = range.getBoundingClientRect().height;
     } catch {
-      sh = 0;
+      /* ignore */
     }
 
-    // Fallback: tallest in-flow body child
-    if (sh < 32) {
-      for (const child of Array.from(body.children)) {
-        if (!(child instanceof HTMLElement)) continue;
-        const st = win?.getComputedStyle(child);
-        if (!st || st.display === "none" || st.position === "fixed") continue;
-        sh = Math.max(sh, child.offsetTop + child.offsetHeight);
-      }
+    // In-flow body children
+    let fromChildren = 0;
+    for (const child of Array.from(body.children)) {
+      if (!(child instanceof HTMLElement)) continue;
+      const st = win?.getComputedStyle(child);
+      if (!st || st.display === "none" || st.position === "fixed") continue;
+      fromChildren = Math.max(fromChildren, child.offsetTop + child.offsetHeight);
     }
 
-    // Last resort
-    if (sh < 32) {
-      sh = Math.max(body.scrollHeight || 0, root.scrollHeight || 0, 64);
+    const scrollH = Math.max(body.scrollHeight || 0, root.scrollHeight || 0);
+
+    // Interactive block
+    let fromInteract = 0;
+    const wrap = body.querySelector(".iframe-wrap") as HTMLElement | null;
+    const live = body.querySelector("canvas, .live-frame") as HTMLElement | null;
+    if (wrap) {
+      fromInteract = Math.max(wrap.offsetHeight, wrap.getBoundingClientRect().height, layoutW * 0.55);
+    } else if (live) {
+      fromInteract = Math.max(live.offsetHeight, layoutW * 0.5);
     }
 
-    const hasInteract = !!body.querySelector(".iframe-wrap, .live-frame, canvas");
+    const hasInteract = !!(wrap || live || body.querySelector("canvas"));
     const hasVideo = !!body.querySelector("video");
-    if (hasInteract) {
-      const wrap = body.querySelector(".iframe-wrap") as HTMLElement | null;
-      if (wrap) {
-        const wh = wrap.getBoundingClientRect().height || wrap.offsetHeight;
-        if (wh > 40) sh = Math.max(sh, Math.ceil(wh + wrap.offsetTop + 8));
-      }
-      sh = Math.max(sh, 160);
-    } else if (hasVideo) {
-      sh = Math.max(sh, 100);
+    const hasImg = !!body.querySelector("img");
+
+    // Pick the best signal; reject scrollH if it's clearly empty expansion vs media
+    const candidates = [fromRange, fromChildren, fromMedia, fromInteract].filter((n) => n > 20);
+    let sh = candidates.length ? Math.max(...candidates) : scrollH;
+
+    // If scrollH agrees roughly, allow it; if much larger, ignore (empty band)
+    if (scrollH > sh * 1.35 && sh > 40) {
+      /* keep sh */
+    } else if (scrollH > sh) {
+      sh = scrollH;
     }
 
-    // Never allow a static page to become a tall empty poster
-    if (!hasInteract && !hasVideo) {
-      sh = Math.min(sh, Math.round(layoutW * 1.25));
-    } else {
-      sh = Math.min(sh, 5000);
-    }
+    if (hasInteract) sh = Math.max(sh, fromInteract || layoutW * 0.55, 200);
+    else if (hasVideo) sh = Math.max(sh, 140);
+    else if (hasImg) sh = Math.max(sh, 80);
+    else sh = Math.max(sh, 60);
 
-    sh = Math.max(48, Math.ceil(sh + 2));
+    // Caps: avoid multi-screen empty pages
+    if (!hasInteract) sh = Math.min(sh, layoutW * 1.8 + fromMedia);
+    else sh = Math.min(sh, 4200);
 
-    page.baseW = layoutW;
-    const sw = Math.max(body.scrollWidth || 0, root.scrollWidth || 0);
-    if (sw > layoutW + 64) page.baseW = Math.min(sw, 2400);
-    page.baseH = sh;
+    page.baseH = Math.max(48, Math.ceil(sh + 6));
     this.ensureTiles(page);
 
+    // Restore iframe to fill the tight shell
+    iframe.style.cssText = prevCss || "";
     iframe.style.position = "absolute";
     iframe.style.left = "0";
     iframe.style.top = "0";
