@@ -811,7 +811,7 @@ export class Engine {
     this.htmlLayoutW = layoutW;
     const pages: Page[] = [];
     for (let i = 0; i < docs.length; i++) {
-      const page = this.makePage(i + 1, layoutW, Math.round(layoutW * 1.25));
+      const page = this.makePage(i + 1, layoutW, Math.round(layoutW * 0.5));
       pages.push(page);
       const blob = new Blob([docs[i]], { type: "text/html" });
       // Drop page HTML string from array to help GC on 30MB lessons
@@ -852,7 +852,7 @@ export class Engine {
         this.measureHtml(pages[i], layoutW);
       } else {
         // Placeholder height until the page is scrolled into view
-        pages[i].baseH = Math.round(layoutW * 1.15);
+        pages[i].baseH = Math.round(layoutW * 0.5);
         this.ensureTiles(pages[i]);
       }
       this.progress("Laying out HTML…", 0.55 + (0.4 * (i + 1)) / pages.length, false);
@@ -1320,28 +1320,24 @@ export class Engine {
   private measureHtml(page: Page, layoutW: number) {
     const iframe = page.iframe;
     const doc = iframe?.contentDocument;
-    if (!doc?.body) {
-      page.baseH = Math.round(layoutW * 0.6);
+    if (!iframe || !doc?.body) {
+      page.baseW = layoutW;
+      page.baseH = Math.round(layoutW * 0.5);
       this.ensureTiles(page);
       return;
     }
     const body = doc.body;
     const root = doc.documentElement;
-    const fine =
-      typeof window !== "undefined" && window.matchMedia("(pointer: fine)").matches;
-    const narrow = layoutW < 760;
-    const contentW = Math.max(260, layoutW - 24);
+    const win = doc.defaultView;
 
-    // --- Video / image soft styles (do not force tall min-heights) ---
     for (const vid of body.querySelectorAll("video")) {
       if (!(vid instanceof HTMLVideoElement)) continue;
-      vid.style.boxSizing = "border-box";
-      vid.style.maxWidth = "100%";
-      vid.style.width = "100%";
-      vid.style.height = "auto";
       vid.controls = true;
       vid.setAttribute("playsinline", "");
       vid.setAttribute("webkit-playsinline", "");
+      vid.style.maxWidth = "100%";
+      vid.style.height = "auto";
+      vid.style.pointerEvents = "auto";
     }
     for (const img of body.querySelectorAll("img")) {
       if (!(img instanceof HTMLImageElement)) continue;
@@ -1349,135 +1345,119 @@ export class Engine {
       img.style.height = "auto";
     }
 
-    // Mobile-only interact sizing
-    if (!fine || narrow) {
-      const interactH = Math.round(
-        Math.min(640, Math.max(contentW * 0.9, Math.min(contentW * 1.1, 480))),
-      );
-      for (const wrap of body.querySelectorAll(".iframe-wrap")) {
-        if (!(wrap instanceof HTMLElement)) continue;
-        wrap.style.width = "100%";
-        wrap.style.maxWidth = "100%";
-        wrap.style.height = `${interactH}px`;
-        wrap.style.minHeight = `${interactH}px`;
-      }
-    }
-
-    // --- Break circular height: iframe was 100% of a tall shell, body filled it ---
-    root.style.setProperty("height", "auto", "important");
-    root.style.setProperty("min-height", "0", "important");
-    body.style.setProperty("height", "auto", "important");
-    body.style.setProperty("min-height", "0", "important");
-    body.style.setProperty("margin", "0", "important");
-    for (const el of body.querySelectorAll(
-      ".page,.pdf-page,.slide,section.page,[data-page],main,article,header,footer",
-    )) {
-      if (!(el instanceof HTMLElement)) continue;
+    // Strip fill-the-viewport rules from the lesson
+    const strip = (el: HTMLElement) => {
       el.style.setProperty("min-height", "0", "important");
       el.style.setProperty("height", "auto", "important");
-    }
-
-    // Give the iframe a huge temporary height so content can lay out naturally,
-    // then measure the real bottom of the content and shrink the page to it.
-    const prevIframeH = iframe!.style.height;
-    const prevIframeMin = iframe!.style.minHeight;
-    iframe!.style.height = "12000px";
-    iframe!.style.minHeight = "0";
-    void body.offsetHeight;
-
-    let bottom = 0;
-    const add = (el: Element) => {
-      if (!(el instanceof HTMLElement)) return;
-      // offsetTop is relative to offsetParent; walk sum for absolute-ish
-      let y = 0;
-      let node: HTMLElement | null = el;
-      while (node && node !== body) {
-        y += node.offsetTop;
-        node = node.offsetParent instanceof HTMLElement ? node.offsetParent : null;
-      }
-      if (node === body || el.parentElement === body) {
-        bottom = Math.max(bottom, y + el.offsetHeight);
-      } else {
-        bottom = Math.max(bottom, el.offsetTop + el.offsetHeight);
-      }
-      // getBoundingClientRect relative to body (works with transforms inside doc)
-      const br = body.getBoundingClientRect();
-      const er = el.getBoundingClientRect();
-      if (er.height > 0) bottom = Math.max(bottom, er.bottom - br.top);
     };
-
-    for (const child of Array.from(body.children)) add(child);
-    for (const el of body.querySelectorAll(
-      "img,video,canvas,svg,iframe,.iframe-wrap,.page,header,main,footer,section,article,nav,h1,h2,p,div",
+    strip(root);
+    strip(body);
+    body.style.setProperty("margin", "0", "important");
+    for (const el of body.querySelectorAll<HTMLElement>(
+      ".page,.pdf-page,.slide,section.page,[data-page],main,article,header,footer",
     )) {
-      add(el);
+      el.style.setProperty("min-height", "0", "important");
     }
 
-    const scrollH = Math.max(body.scrollHeight || 0, root.scrollHeight || 0);
-    // Prefer element-bottom; only use scrollH if it's not wildly larger (empty fill)
-    let sh = bottom;
-    if (sh < 40) sh = scrollH;
-    else if (scrollH > 40 && scrollH < sh * 1.25) sh = Math.max(sh, scrollH);
-    // If scrollH is much larger than any element, ignore it (ghost min-height)
-    // sh stays as bottom
+    // Collapse iframe so % heights inside the lesson resolve against ~0, not a tall shell
+    iframe.style.height = "0px";
+    iframe.style.minHeight = "0px";
+    void root.offsetHeight;
 
-    // Restore iframe to fill whatever shell size we set next
-    iframe!.style.height = prevIframeH || "100%";
-    iframe!.style.minHeight = prevIframeMin || "0";
+    // Most reliable content height: bounding range of body contents
+    let sh = 0;
+    try {
+      const range = doc.createRange();
+      range.selectNodeContents(body);
+      const rect = range.getBoundingClientRect();
+      sh = Math.ceil(rect.height);
+    } catch {
+      sh = 0;
+    }
 
-    const hasInteract = !!body.querySelector(".iframe-wrap,.live-frame,canvas");
+    // Fallback: tallest in-flow body child
+    if (sh < 32) {
+      for (const child of Array.from(body.children)) {
+        if (!(child instanceof HTMLElement)) continue;
+        const st = win?.getComputedStyle(child);
+        if (!st || st.display === "none" || st.position === "fixed") continue;
+        sh = Math.max(sh, child.offsetTop + child.offsetHeight);
+      }
+    }
+
+    // Last resort
+    if (sh < 32) {
+      sh = Math.max(body.scrollHeight || 0, root.scrollHeight || 0, 64);
+    }
+
+    const hasInteract = !!body.querySelector(".iframe-wrap, .live-frame, canvas");
     const hasVideo = !!body.querySelector("video");
-    let minH = 64;
-    if (hasInteract) minH = 200;
-    else if (hasVideo) minH = 140;
-    sh = Math.min(80000, Math.max(minH, Math.ceil(sh + 6)));
+    if (hasInteract) {
+      const wrap = body.querySelector(".iframe-wrap") as HTMLElement | null;
+      if (wrap) {
+        const wh = wrap.getBoundingClientRect().height || wrap.offsetHeight;
+        if (wh > 40) sh = Math.max(sh, Math.ceil(wh + wrap.offsetTop + 8));
+      }
+      sh = Math.max(sh, 160);
+    } else if (hasVideo) {
+      sh = Math.max(sh, 100);
+    }
 
-    const scrollW = Math.max(body.scrollWidth || 0, root.scrollWidth || 0, layoutW);
-    if (scrollW > layoutW + 48) page.baseW = Math.min(scrollW, 2400);
-    else page.baseW = layoutW;
+    // Never allow a static page to become a tall empty poster
+    if (!hasInteract && !hasVideo) {
+      sh = Math.min(sh, Math.round(layoutW * 1.25));
+    } else {
+      sh = Math.min(sh, 5000);
+    }
+
+    sh = Math.max(48, Math.ceil(sh + 2));
+
+    page.baseW = layoutW;
+    const sw = Math.max(body.scrollWidth || 0, root.scrollWidth || 0);
+    if (sw > layoutW + 64) page.baseW = Math.min(sw, 2400);
     page.baseH = sh;
     this.ensureTiles(page);
 
-    // Size iframe to fill the (now tight) page
-    iframe!.style.position = "absolute";
-    iframe!.style.left = "0";
-    iframe!.style.top = "0";
-    iframe!.style.width = "100%";
-    iframe!.style.height = "100%";
-    iframe!.style.border = "0";
-    iframe!.style.touchAction = "auto";
-    try {
-      iframe!.contentWindow?.dispatchEvent(new Event("resize"));
-    } catch {
-      /* ignore */
-    }
+    iframe.style.position = "absolute";
+    iframe.style.left = "0";
+    iframe.style.top = "0";
+    iframe.style.width = "100%";
+    iframe.style.height = "100%";
+    iframe.style.minHeight = "0";
+    iframe.style.border = "0";
+    iframe.style.touchAction = "auto";
   }
 
 
   private watchHtml() {
     this.htmlObserver?.disconnect();
     if (this.doc?.kind !== "html") return;
+    // One-shot remeasure after images load — do not keep observing in a way
+    // that re-inflates page height (that caused huge empty regions).
     this.htmlObserver = new ResizeObserver(() => {
-      if (this.doc?.kind !== "html") return;
-      if (this.mode === "pinch") return;
-      // Debounce: full remeasure keeps height tight to content
-      // (raw scrollHeight was re-inflating empty gray bands)
+      if (this.doc?.kind !== "html" || this.mode === "pinch") return;
       window.clearTimeout(this.resizeT);
       this.resizeT = window.setTimeout(() => {
         if (!this.alive || this.doc?.kind !== "html" || this.mode === "pinch") return;
-        const layoutW = this.htmlLayoutW || this.availableWidth();
+        let changed = false;
         for (const page of this.doc.pages) {
           if (!page.iframe?.contentDocument?.body) continue;
-          const prevH = page.baseH;
-          this.measureHtml(page, page.baseW || layoutW);
-          // Only relayout if height changed meaningfully
-          if (Math.abs(page.baseH - prevH) > 20) {
-            this.layout();
-            this.mountVisible(false);
-            break;
+          const prev = page.baseH;
+          this.measureHtml(page, page.baseW || this.htmlLayoutW || this.availableWidth());
+          // Only accept shrink or modest growth (image finished loading)
+          if (page.baseH > prev + 80) {
+            // Reject large growth — keep previous tight height
+            page.baseH = prev;
+            this.ensureTiles(page);
+          } else if (Math.abs(page.baseH - prev) > 12) {
+            changed = true;
           }
         }
-      }, 180);
+        if (changed) {
+          this.layout();
+          this.mountVisible(false);
+        }
+      }, 200);
     });
     for (const page of this.doc.pages) {
       const body = page.iframe?.contentDocument?.body;
