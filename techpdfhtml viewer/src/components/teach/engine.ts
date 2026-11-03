@@ -1405,65 +1405,66 @@ export class Engine {
       }
     }
 
-    // Shrink-wrap: kill min-heights that stretch the body to the old tall iframe
-    root.style.setProperty("height", "auto", "important");
-    root.style.setProperty("min-height", "0", "important");
-    body.style.setProperty("height", "auto", "important");
-    body.style.setProperty("min-height", "0", "important");
-    for (const pageEl of body.querySelectorAll(".page, .pdf-page, .slide, section.page, [data-page]")) {
+    // Shrink-wrap every height constraint so empty gray bands disappear
+    root.style.cssText += ";height:auto!important;min-height:0!important;";
+    body.style.cssText += ";height:auto!important;min-height:0!important;margin:0!important;";
+    for (const pageEl of body.querySelectorAll(
+      ".page, .pdf-page, .slide, section.page, [data-page], main, article",
+    )) {
       if (!(pageEl instanceof HTMLElement)) continue;
       pageEl.style.setProperty("min-height", "0", "important");
       pageEl.style.setProperty("height", "auto", "important");
+      pageEl.style.setProperty("margin-bottom", "0", "important");
     }
 
     void body.offsetHeight;
 
-    // Measure content from offset geometry inside the document (not the
-    // outer iframe box — that was circular and kept pages hugely tall).
+    // Deepest content edge using getBoundingClientRect relative to body
+    const bodyRect = body.getBoundingClientRect();
     let contentBottom = 0;
-    let contentRight = layoutW;
-    const mark = (el: Element) => {
+    let contentRight = 0;
+    const visit = (el: Element) => {
       if (!(el instanceof HTMLElement)) return;
-      const top = el.offsetTop;
-      const left = el.offsetLeft;
-      const h = el.offsetHeight;
-      const w = el.offsetWidth;
-      if (h > 0) contentBottom = Math.max(contentBottom, top + h);
-      if (w > 0) contentRight = Math.max(contentRight, left + w);
-      // Natural size for not-yet-laid-out images
-      if (el instanceof HTMLImageElement && el.naturalHeight > 0 && h < 8) {
-        contentBottom = Math.max(contentBottom, top + el.naturalHeight);
-      }
-      if (el instanceof HTMLVideoElement && el.videoHeight > 0 && h < 8) {
-        contentBottom = Math.max(contentBottom, top + el.videoHeight);
-      }
+      const r = el.getBoundingClientRect();
+      if (r.height < 1 && r.width < 1) return;
+      contentBottom = Math.max(contentBottom, r.bottom - bodyRect.top);
+      contentRight = Math.max(contentRight, r.right - bodyRect.left);
     };
-
-    for (const child of body.children) mark(child);
+    for (const child of body.children) visit(child);
     for (const el of body.querySelectorAll(
-      "img,video,canvas,svg,iframe,.iframe-wrap,.page,.pdf-page,section,article,header,main,footer",
+      "img,video,canvas,svg,iframe,.iframe-wrap,.page,header,main,footer,section,article,nav",
     )) {
-      mark(el);
+      visit(el);
     }
 
-    // scrollHeight after shrink-wrap (usually matches real content)
-    const scrollH = Math.max(body.scrollHeight, root.scrollHeight, 0);
-    const scrollW = Math.max(body.scrollWidth, root.scrollWidth, layoutW);
-
-    // Prefer the tighter of scrollHeight vs deepest element bottom
-    let sh = contentBottom > 40 ? contentBottom : scrollH;
-    if (scrollH > 40 && contentBottom > 40) {
-      // If scrollHeight is way taller than any element, trust elements (empty min-height trap)
-      if (scrollH > contentBottom * 1.35) sh = contentBottom;
-      else sh = Math.max(contentBottom, scrollH);
+    // Interactive block: use the wrap's own height if present
+    const wrap = body.querySelector(".iframe-wrap") as HTMLElement | null;
+    if (wrap) {
+      const wr = wrap.getBoundingClientRect();
+      contentBottom = Math.max(contentBottom, wr.bottom - bodyRect.top);
     }
 
-    const hasInteract = !!body.querySelector(".iframe-wrap, .live-frame, video, canvas");
-    // Interactive block should keep a usable height; static image pages stay tight
-    const minH = hasInteract ? 280 : 120;
-    const maxH = 80000;
-    sh = Math.min(maxH, Math.max(minH, Math.ceil(sh + 12)));
+    let sh = Math.ceil(contentBottom + 8);
+    // Fallback only if measurement failed
+    if (sh < 40) {
+      sh = Math.max(body.scrollHeight, root.scrollHeight, 120);
+    }
 
+    // Cap insane heights: if body reports 3x more than visible elements, trust elements
+    const scrollH = Math.max(body.scrollHeight, root.scrollHeight);
+    if (contentBottom > 40 && scrollH > contentBottom * 1.5) {
+      sh = Math.ceil(contentBottom + 8);
+    }
+
+    const hasInteract = !!body.querySelector(".iframe-wrap, .live-frame, canvas");
+    const hasVideo = !!body.querySelector("video");
+    // Only force a taller min for real interactive sims — not for a lone header strip
+    let minH = 80;
+    if (hasInteract) minH = 240;
+    else if (hasVideo) minH = 160;
+    sh = Math.min(80000, Math.max(minH, sh));
+
+    const scrollW = Math.max(body.scrollWidth, root.scrollWidth, contentRight, layoutW);
     if (scrollW > layoutW + 48) page.baseW = Math.min(scrollW, 2400);
     else page.baseW = layoutW;
     page.baseH = sh;
@@ -1750,20 +1751,32 @@ export class Engine {
       }
       .teach-content-fs:hover { background: rgba(15,23,42,0.95); }
       .teach-content-overlay {
-        position: fixed;
-        inset: 0;
-        z-index: 99999;
-        background: #000;
-        display: flex;
-        flex-direction: column;
+        position: fixed !important;
+        inset: 0 !important;
+        top: 0 !important; right: 0 !important; bottom: 0 !important; left: 0 !important;
+        z-index: 99999 !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        background: #000 !important;
+        border: none !important;
+        width: 100vw !important;
+        height: 100vh !important;
+        max-width: 100vw !important;
+        max-height: 100vh !important;
+        overflow: hidden !important;
       }
       .teach-content-overlay iframe,
       .teach-content-overlay video {
-        flex: 1;
-        width: 100%;
-        height: 100%;
-        border: 0;
-        background: #000;
+        position: absolute !important;
+        inset: 0 !important;
+        width: 100% !important;
+        height: 100% !important;
+        border: 0 !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        background: #000 !important;
+        max-width: none !important;
+        max-height: none !important;
       }
       .teach-content-overlay-bar {
         position: absolute;
@@ -2303,6 +2316,46 @@ export class Engine {
     if (event.pointerType === "mouse" && event.button !== 0) {
       if (!(toolNow === "laser" && event.button === 2)) return;
     }
+
+    // ===== VIDEO / HTML NATIVE CLICK (Hand tool) =====
+    // Must run BEFORE pointers / capture so the browser delivers the click
+    // to <video controls> and iframe content (play, scrub, pause).
+    if (toolNow === "hand" && event.button === 0) {
+      const t = event.target;
+      // Direct hit on media-layer video
+      if (t instanceof HTMLVideoElement) {
+        t.controls = true;
+        t.style.pointerEvents = "auto";
+        this.videoFocus = true;
+        this.patch({ video: true });
+        return;
+      }
+      if (t instanceof Element) {
+        const mediaVideo = t.closest(".media-item")?.querySelector("video");
+        if (mediaVideo instanceof HTMLVideoElement) {
+          mediaVideo.controls = true;
+          mediaVideo.style.pointerEvents = "auto";
+          this.videoFocus = true;
+          this.patch({ video: true });
+          return;
+        }
+        // Click landed on the iframe element itself → native pass-through
+        if (t instanceof HTMLIFrameElement || t.closest("iframe.html-frame, iframe")) {
+          const page = this.pageAt(event.clientX, event.clientY);
+          if (page?.iframe) {
+            this.tryInteractHtml(event.clientX, event.clientY);
+            this.htmlHandPending = {
+              x: event.clientX,
+              y: event.clientY,
+              pointerId: event.pointerId,
+              page,
+            };
+          }
+          return;
+        }
+      }
+    }
+
     this.pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
     const capture = () => {
       try {
@@ -3124,6 +3177,8 @@ export class Engine {
 
     const overlay = document.createElement("div");
     overlay.className = "teach-content-overlay";
+    overlay.style.cssText =
+      "position:fixed;inset:0;z-index:99999;margin:0;padding:0;background:#000;width:100vw;height:100vh;overflow:hidden;";
     const bar = document.createElement("div");
     bar.className = "teach-content-overlay-bar";
     const closeBtn = document.createElement("button");
@@ -3146,6 +3201,8 @@ export class Engine {
         "allow-scripts allow-same-origin allow-forms allow-popups allow-presentation",
       );
       frame.setAttribute("allow", "autoplay; fullscreen; picture-in-picture");
+      frame.style.cssText =
+        "position:absolute;inset:0;width:100%;height:100%;border:0;margin:0;padding:0;background:#000;";
       frame.src = src;
       // Auto-unlock interactive content after load
       frame.addEventListener("load", () => {
