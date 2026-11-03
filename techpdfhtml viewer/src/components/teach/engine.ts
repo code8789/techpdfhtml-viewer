@@ -1318,9 +1318,10 @@ export class Engine {
   }
 
   private measureHtml(page: Page, layoutW: number) {
-    const doc = page.iframe?.contentDocument;
+    const iframe = page.iframe;
+    const doc = iframe?.contentDocument;
     if (!doc?.body) {
-      page.baseH = Math.round(layoutW * 1.25);
+      page.baseH = Math.round(layoutW * 0.6);
       this.ensureTiles(page);
       return;
     }
@@ -1329,164 +1330,129 @@ export class Engine {
     const fine =
       typeof window !== "undefined" && window.matchMedia("(pointer: fine)").matches;
     const narrow = layoutW < 760;
-
     const contentW = Math.max(260, layoutW - 24);
-    const interactH = Math.round(
-      Math.min(720, Math.max(contentW * 1.05, Math.min(contentW * 1.2, 560))),
-    );
 
-    // Only force interactive wrapper sizes on small / touch layouts.
-    // Desktop HD lessons (canvas sims) keep their own CSS.
-    if (!fine || narrow) {
-      for (const wrap of body.querySelectorAll(".iframe-wrap")) {
-        if (!(wrap instanceof HTMLElement)) continue;
-        wrap.style.boxSizing = "border-box";
-        wrap.style.width = "100%";
-        wrap.style.maxWidth = "100%";
-        wrap.style.height = `${interactH}px`;
-        wrap.style.minHeight = `${interactH}px`;
-        wrap.style.maxHeight = "none";
-        wrap.style.margin = "0 auto";
-        wrap.style.overflow = "hidden";
-        for (const frame of wrap.querySelectorAll("iframe, .live-frame")) {
-          if (!(frame instanceof HTMLElement)) continue;
-          frame.style.width = "100%";
-          frame.style.height = "100%";
-          frame.style.minHeight = `${interactH}px`;
-          frame.style.border = "0";
-          frame.style.display = "block";
-        }
-      }
-
-      for (const pageEl of body.querySelectorAll(".page, section.page")) {
-        if (!(pageEl instanceof HTMLElement)) continue;
-        pageEl.style.minHeight = "auto";
-        pageEl.style.padding = "10px";
-      }
-    }
-
+    // --- Video / image soft styles (do not force tall min-heights) ---
     for (const vid of body.querySelectorAll("video")) {
       if (!(vid instanceof HTMLVideoElement)) continue;
       vid.style.boxSizing = "border-box";
       vid.style.maxWidth = "100%";
       vid.style.width = "100%";
       vid.style.height = "auto";
-      vid.style.maxHeight = "none";
-      vid.style.display = "block";
-      vid.style.margin = "0 auto";
       vid.controls = true;
       vid.setAttribute("playsinline", "");
       vid.setAttribute("webkit-playsinline", "");
-      if (vid.videoWidth > 0 && vid.videoHeight > 0) {
-        const ratio = vid.videoHeight / vid.videoWidth;
-        vid.style.aspectRatio = `${vid.videoWidth} / ${vid.videoHeight}`;
-        const ideal = Math.round(contentW * ratio);
-        if (ideal > 120) vid.style.minHeight = `${Math.min(ideal, 720)}px`;
-      } else if (!fine || narrow) {
-        vid.style.minHeight = `${Math.round(contentW * 0.56)}px`;
-      }
     }
-
     for (const img of body.querySelectorAll("img")) {
       if (!(img instanceof HTMLImageElement)) continue;
       img.style.maxWidth = "100%";
       img.style.height = "auto";
-      img.style.maxHeight = "none";
     }
 
-    // Canvas scenes: ensure they fill their container crisply on desktop
-    for (const canvas of body.querySelectorAll("canvas")) {
-      if (!(canvas instanceof HTMLCanvasElement)) continue;
-      const parent = canvas.parentElement;
-      if (parent instanceof HTMLElement) {
-        // Prefer container-driven size (solar system .scene)
-        if (!canvas.style.width) canvas.style.width = "100%";
-        if (!canvas.style.height) canvas.style.height = "100%";
+    // Mobile-only interact sizing
+    if (!fine || narrow) {
+      const interactH = Math.round(
+        Math.min(640, Math.max(contentW * 0.9, Math.min(contentW * 1.1, 480))),
+      );
+      for (const wrap of body.querySelectorAll(".iframe-wrap")) {
+        if (!(wrap instanceof HTMLElement)) continue;
+        wrap.style.width = "100%";
+        wrap.style.maxWidth = "100%";
+        wrap.style.height = `${interactH}px`;
+        wrap.style.minHeight = `${interactH}px`;
       }
     }
 
-    // Shrink-wrap every height constraint so empty gray bands disappear
-    root.style.cssText += ";height:auto!important;min-height:0!important;";
-    body.style.cssText += ";height:auto!important;min-height:0!important;margin:0!important;";
-    for (const pageEl of body.querySelectorAll(
-      ".page, .pdf-page, .slide, section.page, [data-page], main, article",
+    // --- Break circular height: iframe was 100% of a tall shell, body filled it ---
+    root.style.setProperty("height", "auto", "important");
+    root.style.setProperty("min-height", "0", "important");
+    body.style.setProperty("height", "auto", "important");
+    body.style.setProperty("min-height", "0", "important");
+    body.style.setProperty("margin", "0", "important");
+    for (const el of body.querySelectorAll(
+      ".page,.pdf-page,.slide,section.page,[data-page],main,article,header,footer",
     )) {
-      if (!(pageEl instanceof HTMLElement)) continue;
-      pageEl.style.setProperty("min-height", "0", "important");
-      pageEl.style.setProperty("height", "auto", "important");
-      pageEl.style.setProperty("margin-bottom", "0", "important");
+      if (!(el instanceof HTMLElement)) continue;
+      el.style.setProperty("min-height", "0", "important");
+      el.style.setProperty("height", "auto", "important");
     }
 
+    // Give the iframe a huge temporary height so content can lay out naturally,
+    // then measure the real bottom of the content and shrink the page to it.
+    const prevIframeH = iframe!.style.height;
+    const prevIframeMin = iframe!.style.minHeight;
+    iframe!.style.height = "12000px";
+    iframe!.style.minHeight = "0";
     void body.offsetHeight;
 
-    // Deepest content edge using getBoundingClientRect relative to body
-    const bodyRect = body.getBoundingClientRect();
-    let contentBottom = 0;
-    let contentRight = 0;
-    const visit = (el: Element) => {
+    let bottom = 0;
+    const add = (el: Element) => {
       if (!(el instanceof HTMLElement)) return;
-      const r = el.getBoundingClientRect();
-      if (r.height < 1 && r.width < 1) return;
-      contentBottom = Math.max(contentBottom, r.bottom - bodyRect.top);
-      contentRight = Math.max(contentRight, r.right - bodyRect.left);
+      // offsetTop is relative to offsetParent; walk sum for absolute-ish
+      let y = 0;
+      let node: HTMLElement | null = el;
+      while (node && node !== body) {
+        y += node.offsetTop;
+        node = node.offsetParent instanceof HTMLElement ? node.offsetParent : null;
+      }
+      if (node === body || el.parentElement === body) {
+        bottom = Math.max(bottom, y + el.offsetHeight);
+      } else {
+        bottom = Math.max(bottom, el.offsetTop + el.offsetHeight);
+      }
+      // getBoundingClientRect relative to body (works with transforms inside doc)
+      const br = body.getBoundingClientRect();
+      const er = el.getBoundingClientRect();
+      if (er.height > 0) bottom = Math.max(bottom, er.bottom - br.top);
     };
-    for (const child of body.children) visit(child);
+
+    for (const child of Array.from(body.children)) add(child);
     for (const el of body.querySelectorAll(
-      "img,video,canvas,svg,iframe,.iframe-wrap,.page,header,main,footer,section,article,nav",
+      "img,video,canvas,svg,iframe,.iframe-wrap,.page,header,main,footer,section,article,nav,h1,h2,p,div",
     )) {
-      visit(el);
+      add(el);
     }
 
-    // Interactive block: use the wrap's own height if present
-    const wrap = body.querySelector(".iframe-wrap") as HTMLElement | null;
-    if (wrap) {
-      const wr = wrap.getBoundingClientRect();
-      contentBottom = Math.max(contentBottom, wr.bottom - bodyRect.top);
-    }
+    const scrollH = Math.max(body.scrollHeight || 0, root.scrollHeight || 0);
+    // Prefer element-bottom; only use scrollH if it's not wildly larger (empty fill)
+    let sh = bottom;
+    if (sh < 40) sh = scrollH;
+    else if (scrollH > 40 && scrollH < sh * 1.25) sh = Math.max(sh, scrollH);
+    // If scrollH is much larger than any element, ignore it (ghost min-height)
+    // sh stays as bottom
 
-    let sh = Math.ceil(contentBottom + 8);
-    // Fallback only if measurement failed
-    if (sh < 40) {
-      sh = Math.max(body.scrollHeight, root.scrollHeight, 120);
-    }
+    // Restore iframe to fill whatever shell size we set next
+    iframe!.style.height = prevIframeH || "100%";
+    iframe!.style.minHeight = prevIframeMin || "0";
 
-    // Cap insane heights: if body reports 3x more than visible elements, trust elements
-    const scrollH = Math.max(body.scrollHeight, root.scrollHeight);
-    if (contentBottom > 40 && scrollH > contentBottom * 1.5) {
-      sh = Math.ceil(contentBottom + 8);
-    }
-
-    const hasInteract = !!body.querySelector(".iframe-wrap, .live-frame, canvas");
+    const hasInteract = !!body.querySelector(".iframe-wrap,.live-frame,canvas");
     const hasVideo = !!body.querySelector("video");
-    // Only force a taller min for real interactive sims — not for a lone header strip
-    let minH = 80;
-    if (hasInteract) minH = 240;
-    else if (hasVideo) minH = 160;
-    sh = Math.min(80000, Math.max(minH, sh));
+    let minH = 64;
+    if (hasInteract) minH = 200;
+    else if (hasVideo) minH = 140;
+    sh = Math.min(80000, Math.max(minH, Math.ceil(sh + 6)));
 
-    const scrollW = Math.max(body.scrollWidth, root.scrollWidth, contentRight, layoutW);
+    const scrollW = Math.max(body.scrollWidth || 0, root.scrollWidth || 0, layoutW);
     if (scrollW > layoutW + 48) page.baseW = Math.min(scrollW, 2400);
     else page.baseW = layoutW;
     page.baseH = sh;
     this.ensureTiles(page);
 
-    // Size the iframe itself to fill the page so touches hit the content
-    if (page.iframe) {
-      page.iframe.style.position = "absolute";
-      page.iframe.style.left = "0";
-      page.iframe.style.top = "0";
-      page.iframe.style.width = "100%";
-      page.iframe.style.height = "100%";
-      page.iframe.style.border = "0";
-      page.iframe.style.touchAction = "auto";
-      // Ask the lesson to re-measure (canvas resize / HD redraw)
-      try {
-        page.iframe.contentWindow?.dispatchEvent(new Event("resize"));
-      } catch {
-        /* ignore */
-      }
+    // Size iframe to fill the (now tight) page
+    iframe!.style.position = "absolute";
+    iframe!.style.left = "0";
+    iframe!.style.top = "0";
+    iframe!.style.width = "100%";
+    iframe!.style.height = "100%";
+    iframe!.style.border = "0";
+    iframe!.style.touchAction = "auto";
+    try {
+      iframe!.contentWindow?.dispatchEvent(new Event("resize"));
+    } catch {
+      /* ignore */
     }
   }
+
 
   private watchHtml() {
     this.htmlObserver?.disconnect();
@@ -1527,7 +1493,9 @@ export class Engine {
     inner.className = "page-inner";
     const fill = document.createElement("div");
     fill.className = "page-fill";
-    fill.textContent = `Page ${index}`;
+    fill.style.background = "transparent";
+    fill.style.color = "transparent";
+    fill.textContent = "";
     const mediaLayer = document.createElement("div");
     mediaLayer.className = "media-layer";
     const tilesHost = document.createElement("div");
@@ -1706,6 +1674,7 @@ export class Engine {
         padding: 0 !important;
       }
       .page-inner { margin: 0 !important; padding: 0 !important; }
+      .page-fill { background: transparent !important; color: transparent !important; }
       .tiles-host { pointer-events: none !important; }
       .media-item video, .html-frame video {
         pointer-events: auto !important;
