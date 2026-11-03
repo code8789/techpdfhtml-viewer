@@ -151,6 +151,7 @@ video{
   touch-action:manipulation!important;
   pointer-events:auto!important;
   -webkit-playsinline:true;
+  playsinline:true;
 }
 .page,.pdf-page,.pdfPage,.slide,section.page,[data-page]{
   display:block!important;visibility:visible!important;opacity:1!important;
@@ -807,6 +808,7 @@ export class Engine {
     const layoutW = fine
       ? Math.max(480, Math.min(1600, avail))
       : Math.max(280, Math.min(960, avail));
+    this.htmlLayoutW = layoutW;
     const pages: Page[] = [];
     for (let i = 0; i < docs.length; i++) {
       const page = this.makePage(i + 1, layoutW, Math.round(layoutW * 1.25));
@@ -1403,48 +1405,68 @@ export class Engine {
       }
     }
 
+    // Shrink-wrap: kill min-heights that stretch the body to the old tall iframe
+    root.style.setProperty("height", "auto", "important");
+    root.style.setProperty("min-height", "0", "important");
+    body.style.setProperty("height", "auto", "important");
+    body.style.setProperty("min-height", "0", "important");
+    for (const pageEl of body.querySelectorAll(".page, .pdf-page, .slide, section.page, [data-page]")) {
+      if (!(pageEl instanceof HTMLElement)) continue;
+      pageEl.style.setProperty("min-height", "0", "important");
+      pageEl.style.setProperty("height", "auto", "important");
+    }
+
     void body.offsetHeight;
 
-    const sw = Math.max(root.scrollWidth, body.scrollWidth, layoutW);
-    let sh = Math.max(root.scrollHeight, body.scrollHeight, 320);
+    // Measure content from offset geometry inside the document (not the
+    // outer iframe box — that was circular and kept pages hugely tall).
+    let contentBottom = 0;
+    let contentRight = layoutW;
+    const mark = (el: Element) => {
+      if (!(el instanceof HTMLElement)) return;
+      const top = el.offsetTop;
+      const left = el.offsetLeft;
+      const h = el.offsetHeight;
+      const w = el.offsetWidth;
+      if (h > 0) contentBottom = Math.max(contentBottom, top + h);
+      if (w > 0) contentRight = Math.max(contentRight, left + w);
+      // Natural size for not-yet-laid-out images
+      if (el instanceof HTMLImageElement && el.naturalHeight > 0 && h < 8) {
+        contentBottom = Math.max(contentBottom, top + el.naturalHeight);
+      }
+      if (el instanceof HTMLVideoElement && el.videoHeight > 0 && h < 8) {
+        contentBottom = Math.max(contentBottom, top + el.videoHeight);
+      }
+    };
 
-    let stack = 0;
-    for (const el of body.querySelectorAll("img,video,canvas,svg,iframe,.iframe-wrap,.page")) {
-      if (!(el instanceof HTMLElement)) continue;
-      const rect = el.getBoundingClientRect();
-      stack = Math.max(stack, rect.bottom);
-      const natural =
-        el instanceof HTMLImageElement
-          ? el.naturalHeight
-          : el instanceof HTMLVideoElement
-            ? el.videoHeight
-            : 0;
-      if (rect.height < 8 && natural > 8) stack = Math.max(stack, rect.top + natural);
+    for (const child of body.children) mark(child);
+    for (const el of body.querySelectorAll(
+      "img,video,canvas,svg,iframe,.iframe-wrap,.page,.pdf-page,section,article,header,main,footer",
+    )) {
+      mark(el);
     }
 
-    // Also account for fixed/absolute labels (page-number, gif-label) that
-    // sit outside the main flow on some interactive pages.
-    for (const el of body.querySelectorAll(".page-number,.gif-label,.tap-to-play")) {
-      if (!(el instanceof HTMLElement)) continue;
-      const rect = el.getBoundingClientRect();
-      stack = Math.max(stack, rect.bottom + 12);
+    // scrollHeight after shrink-wrap (usually matches real content)
+    const scrollH = Math.max(body.scrollHeight, root.scrollHeight, 0);
+    const scrollW = Math.max(body.scrollWidth, root.scrollWidth, layoutW);
+
+    // Prefer the tighter of scrollHeight vs deepest element bottom
+    let sh = contentBottom > 40 ? contentBottom : scrollH;
+    if (scrollH > 40 && contentBottom > 40) {
+      // If scrollHeight is way taller than any element, trust elements (empty min-height trap)
+      if (scrollH > contentBottom * 1.35) sh = contentBottom;
+      else sh = Math.max(contentBottom, scrollH);
     }
 
-    const frameH = page.iframe?.getBoundingClientRect().height || page.baseH;
-    if (stack > 8) {
-      const scale = frameH > 8 ? page.baseH / frameH : 1;
-      sh = Math.max(sh, stack * (Number.isFinite(scale) && scale > 0 ? scale : 1));
-    }
-
-    // Prefer content width when the HTML is wider than the phone, but keep
-    // a sensible minimum so text does not crush the interactive area.
-    if (sw > layoutW + 48) page.baseW = Math.min(sw, 2400);
-    else page.baseW = layoutW;
-
-    // Use real content height — do not pad hundreds of empty pixels between pages
     const hasInteract = !!body.querySelector(".iframe-wrap, .live-frame, video, canvas");
-    const minH = hasInteract ? 320 : 200;
-    page.baseH = Math.min(80000, Math.max(minH, Math.ceil(sh + 16)));
+    // Interactive block should keep a usable height; static image pages stay tight
+    const minH = hasInteract ? 280 : 120;
+    const maxH = 80000;
+    sh = Math.min(maxH, Math.max(minH, Math.ceil(sh + 12)));
+
+    if (scrollW > layoutW + 48) page.baseW = Math.min(scrollW, 2400);
+    else page.baseW = layoutW;
+    page.baseH = sh;
     this.ensureTiles(page);
 
     // Size the iframe itself to fill the page so touches hit the content
@@ -1470,24 +1492,25 @@ export class Engine {
     if (this.doc?.kind !== "html") return;
     this.htmlObserver = new ResizeObserver(() => {
       if (this.doc?.kind !== "html") return;
-      // Never reflow while pinching — this was freezing zoom on large HTML
       if (this.mode === "pinch") return;
-      let grew = false;
-      for (const page of this.doc.pages) {
-        const doc = page.iframe?.contentDocument;
-        if (!doc) continue;
-        const sh = Math.max(doc.documentElement.scrollHeight, doc.body?.scrollHeight ?? 0);
-        const next = Math.min(80000, Math.max(page.baseH, sh));
-        if (next > page.baseH + 24) {
-          page.baseH = next;
-          this.ensureTiles(page);
-          grew = true;
+      // Debounce: full remeasure keeps height tight to content
+      // (raw scrollHeight was re-inflating empty gray bands)
+      window.clearTimeout(this.resizeT);
+      this.resizeT = window.setTimeout(() => {
+        if (!this.alive || this.doc?.kind !== "html" || this.mode === "pinch") return;
+        const layoutW = this.htmlLayoutW || this.availableWidth();
+        for (const page of this.doc.pages) {
+          if (!page.iframe?.contentDocument?.body) continue;
+          const prevH = page.baseH;
+          this.measureHtml(page, page.baseW || layoutW);
+          // Only relayout if height changed meaningfully
+          if (Math.abs(page.baseH - prevH) > 20) {
+            this.layout();
+            this.mountVisible(false);
+            break;
+          }
         }
-      }
-      if (grew) {
-        this.layout();
-        this.mountVisible(false);
-      }
+      }, 180);
     });
     for (const page of this.doc.pages) {
       const body = page.iframe?.contentDocument?.body;
@@ -2349,41 +2372,12 @@ export class Engine {
       return;
     }
 
-    // Hand + video media: unlock native controls (don't start drag)
-    if (hit && prefs.tool === "hand" && hit.media.kind === "video") {
-      const video = hit.el.querySelector("video");
-      if (video instanceof HTMLVideoElement) {
-        video.controls = true;
-        video.setAttribute("playsinline", "");
-        video.setAttribute("webkit-playsinline", "");
-        video.style.pointerEvents = "auto";
-        video.style.touchAction = "manipulation";
-        this.videoFocus = true;
-        this.patch({ video: true });
-        try {
-          video.focus({ preventScroll: true });
-        } catch {
-          try {
-            video.focus();
-          } catch {
-            /* ignore */
-          }
-        }
-        // Toggle play on this user gesture (required on mobile)
-        if (video.paused) {
-          void video.play().catch(() => {
-            /* user can use controls */
-          });
-        } else {
-          video.pause();
-        }
-        this.say("Video ready – use the controls");
-        // Do not capture — let controls receive later taps
-        return;
-      }
-    }
-
-    if (hit && hit.mode === "move" && (prefs.tool === "hand" || this.selectedMediaId === hit.media.id)) {
+    if (
+      hit &&
+      hit.mode === "move" &&
+      (prefs.tool === "hand" || this.selectedMediaId === hit.media.id) &&
+      !(prefs.tool === "hand" && hit.media.kind === "video")
+    ) {
       this.selectMedia(hit.media.id);
       this.beginMedia(hit, event, "move");
       event.preventDefault();
@@ -2399,28 +2393,42 @@ export class Engine {
     }
 
     if (prefs.tool === "hand") {
-      // Always try video / tap-to-interact first (no capture)
-      const interacted = this.tryInteractHtml(event.clientX, event.clientY);
-      if (interacted) return;
+      // --- Native video / interactive pass-through (do not steal the click) ---
+      // 1) Media-layer video: let the <video controls> receive the event
+      if (hit && hit.media.kind === "video") {
+        const video = hit.el.querySelector("video");
+        if (video instanceof HTMLVideoElement) {
+          video.controls = true;
+          video.setAttribute("playsinline", "");
+          video.setAttribute("webkit-playsinline", "");
+          video.style.pointerEvents = "auto";
+          video.style.touchAction = "manipulation";
+          this.videoFocus = true;
+          this.patch({ video: true });
+          // NO preventDefault, NO capture, NO video.play() — native controls work
+          return;
+        }
+      }
 
+      // 2) HTML iframe: unlock interact / detect video, then let native UI handle
       const page = this.pageAt(event.clientX, event.clientY);
-      // Over an HTML iframe: do NOT capture yet — a click must reach the video.
-      // If the pointer moves, we start pan in pointermove.
       if (page?.iframe) {
         const ir = page.iframe.getBoundingClientRect();
-        if (
+        const overIframe =
           event.clientX >= ir.left &&
           event.clientX <= ir.right &&
           event.clientY >= ir.top &&
-          event.clientY <= ir.bottom
-        ) {
+          event.clientY <= ir.bottom;
+        if (overIframe) {
+          // Prepare interact / video attributes but do not steal the pointer
+          this.tryInteractHtml(event.clientX, event.clientY);
           this.htmlHandPending = {
             x: event.clientX,
             y: event.clientY,
             pointerId: event.pointerId,
             page,
           };
-          // Do not preventDefault / setPointerCapture — allow the iframe click
+          // Critical: no preventDefault / no setPointerCapture
           return;
         }
       }
@@ -2517,10 +2525,15 @@ export class Engine {
       tracked.y = event.clientY;
     }
     // Hand on HTML: convert to pan once the user actually drags
-    if (this.htmlHandPending && this.htmlHandPending.pointerId === event.pointerId) {
+    // Skip while video controls are active so scrubbing the timeline is not stolen
+    if (
+      this.htmlHandPending &&
+      this.htmlHandPending.pointerId === event.pointerId &&
+      !this.videoFocus
+    ) {
       const dx = event.clientX - this.htmlHandPending.x;
       const dy = event.clientY - this.htmlHandPending.y;
-      if (Math.hypot(dx, dy) > 8) {
+      if (Math.hypot(dx, dy) > 10) {
         const startX = this.htmlHandPending.x;
         const startY = this.htmlHandPending.y;
         this.htmlHandPending = null;
@@ -3214,6 +3227,8 @@ export class Engine {
   }
 
   private unlockVideo(video: HTMLVideoElement, iframe?: HTMLIFrameElement | null) {
+    // Only arm native controls — do NOT play/pause here.
+    // The real click must reach the <video> so the browser allows control UI.
     video.setAttribute("playsinline", "");
     video.setAttribute("webkit-playsinline", "");
     video.setAttribute("controls", "true");
@@ -3227,24 +3242,7 @@ export class Engine {
     }
     this.videoFocus = true;
     this.patch({ video: true });
-    try {
-      video.focus({ preventScroll: true });
-    } catch {
-      try {
-        video.focus();
-      } catch {
-        /* ignore */
-      }
-    }
-    if (video.paused) {
-      void video.play().catch(() => {
-        /* controls still available */
-      });
-      this.say("Playing – click controls to pause");
-    } else {
-      video.pause();
-      this.say("Paused");
-    }
+    this.say("Video controls ready");
   }
 
   private unlockInteractive(page: Page, iframe: HTMLIFrameElement, tapBtn?: HTMLElement | null) {
