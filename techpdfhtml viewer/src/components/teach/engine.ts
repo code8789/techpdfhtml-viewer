@@ -871,11 +871,17 @@ export class Engine {
     this.layout();
     this.mountVisible(true);
     for (const page of pages) this.ensureContentFsButton(page);
+    // Fill the desktop viewer
+    try {
+      this.fit();
+    } catch {
+      /* ignore */
+    }
     this.patch({ progress: null });
     this.say(
       pages.length > 1
-        ? `HTML ready — ${pages.length} pages (large pages load as you scroll)`
-        : "HTML ready — GIFs and video stay live",
+        ? `HTML ready — ${pages.length} pages · fit to screen`
+        : "HTML ready · fit to screen",
     );
     this.els.scroll.scrollTop = 0;
     this.els.scroll.scrollLeft = 0;
@@ -983,8 +989,55 @@ export class Engine {
     this.zoomAround(next);
   }
 
+  /**
+   * Fit the current page to the whole desktop viewer
+   * (as large as possible without cropping).
+   */
   fit() {
-    this.zoomAround(1);
+    if (!this.doc) {
+      this.zoomAround(1);
+      return;
+    }
+    const page = this.currentPage() || this.doc.pages[0];
+    if (!page || page.baseW < 8 || page.baseH < 8) {
+      this.zoomAround(1);
+      return;
+    }
+    // Ensure HTML base width matches the desktop viewer first
+    if (this.doc.kind === "html") {
+      const targetW = this.availableWidth();
+      if (Math.abs(page.baseW - targetW) > 8) {
+        for (const p of this.doc.pages) {
+          if (p.iframe?.contentDocument?.body) {
+            this.measureHtml(p, targetW);
+          } else {
+            const ratio = p.baseH / Math.max(1, p.baseW);
+            p.baseW = targetW;
+            p.baseH = Math.max(48, Math.round(targetW * ratio));
+            this.ensureTiles(p);
+          }
+        }
+        this.htmlLayoutW = targetW;
+        this.layout();
+      }
+    }
+    const availW = Math.max(1, this.availableWidth());
+    const viewW = Math.max(1, this.els.scroll.clientWidth - 4);
+    const viewH = Math.max(1, this.els.scroll.clientHeight - 4);
+    // On-screen size at zoom Z: width = availW * Z, height = baseH * (availW/baseW) * Z
+    const zForWidth = viewW / availW;
+    const zForHeight = viewH / (page.baseH * (availW / page.baseW));
+    let z = Math.min(zForWidth, zForHeight);
+    z = clamp(z, MIN_Z, MAX_Z);
+    z = Math.round(z * 20) / 20; // 5% steps
+    this.userZoom = z;
+    this.committedZoom = z;
+    this.visualRatio = 1;
+    this.layout();
+    this.hooks.onZoom(z);
+    this.patch({ zoom: z });
+    this.goTo(this.current);
+    this.say(`Fit to screen · ${Math.round(z * 100)}%`);
   }
 
   prev() {
@@ -1606,7 +1659,12 @@ export class Engine {
   }
 
   private availableWidth() {
-    return Math.max(220, this.els.scroll.clientWidth - 24);
+    // Use nearly the full desktop viewer width
+    return Math.max(220, this.els.scroll.clientWidth - 4);
+  }
+
+  private availableHeight() {
+    return Math.max(180, this.els.scroll.clientHeight - 4);
   }
 
   private displayScale() {
@@ -1626,6 +1684,7 @@ export class Engine {
       const h = page.baseH * S;
       page.shell.style.width = `${w}px`;
       page.shell.style.height = `${h}px`;
+      page.shell.style.maxWidth = "100%";
       page.shell.style.marginLeft = "auto";
       page.shell.style.marginRight = "auto";
       // Always keep inner at base pixel size; scale with transform when zoom ≠ 100%.
@@ -1665,15 +1724,16 @@ export class Engine {
   private applyChromeSpace() {
     const stage = this.els.stage;
     stage.style.setProperty("display", "block", "important");
-    stage.style.setProperty("padding", "2px", "important");
-    stage.style.setProperty("gap", "0px", "important");
-    stage.style.setProperty("row-gap", "0px", "important");
-    stage.style.setProperty("column-gap", "0px", "important");
+    stage.style.setProperty("padding", "0", "important");
+    stage.style.setProperty("gap", "0", "important");
+    stage.style.setProperty("row-gap", "0", "important");
+    stage.style.setProperty("column-gap", "0", "important");
+    stage.style.setProperty("width", "100%", "important");
     const pages = this.doc?.pages ?? [];
     pages.forEach((page, i) => {
       page.shell.style.setProperty("display", "block", "important");
       page.shell.style.setProperty("padding", "0", "important");
-      // One-line gap under every page except the last
+      page.shell.style.setProperty("max-width", "100%", "important");
       const mb = i < pages.length - 1 ? "4px" : "0";
       page.shell.style.setProperty("margin", `0 auto ${mb} auto`, "important");
     });
