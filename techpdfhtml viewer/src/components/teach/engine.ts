@@ -156,7 +156,7 @@ video{
 .page,.pdf-page,.pdfPage,.slide,section.page,[data-page]{
   display:block!important;visibility:visible!important;opacity:1!important;
   position:relative!important;inset:auto!important;transform:none!important;
-  overflow:visible!important;height:auto!important;min-height:160px;
+  overflow:visible!important;height:auto!important;
 }
 .iframe-wrap,.live-frame,iframe{
   touch-action:auto!important;
@@ -200,7 +200,6 @@ video{
   }
   .page{
     padding:10px!important;
-    min-height:auto!important;
   }
 }
 </style>
@@ -506,6 +505,7 @@ export class Engine {
   private pdf: PdfDocProxy | null = null;
   private pdfBlob: Blob | null = null;
   private htmlSource = "";
+  private htmlLayoutW = 0;
   private docName = "";
   private docGen = 0;
   private pageByEl = new Map<Element, Page>();
@@ -1390,30 +1390,25 @@ export class Engine {
     for (const vid of body.querySelectorAll("video")) {
       if (!(vid instanceof HTMLVideoElement)) continue;
       if (vid.videoWidth > 0 && vid.videoHeight > 0) {
-        fromMedia = Math.max(
-          fromMedia,
-          (layoutW * vid.videoHeight) / vid.videoWidth,
-        );
+        fromMedia = Math.max(fromMedia, (layoutW * vid.videoHeight) / vid.videoWidth);
       }
     }
 
-    // Content range height
-    let fromRange = 0;
-    try {
-      const range = doc.createRange();
-      range.selectNodeContents(body);
-      fromRange = range.getBoundingClientRect().height;
-    } catch {
-      /* ignore */
+    // Real content bottom: lowest visible element edge + scroll offset
+    let fromBottom = 0;
+    const scrollY = win?.scrollY ?? 0;
+    for (const el of body.querySelectorAll<HTMLElement>("*")) {
+      const st = win?.getComputedStyle(el);
+      if (!st || st.display === "none" || st.visibility === "hidden" || st.position === "fixed") continue;
+      const r = el.getBoundingClientRect();
+      if (r.height < 1 && r.width < 1) continue;
+      fromBottom = Math.max(fromBottom, r.bottom + scrollY);
     }
-
-    // In-flow body children
-    let fromChildren = 0;
-    for (const child of Array.from(body.children)) {
-      if (!(child instanceof HTMLElement)) continue;
-      const st = win?.getComputedStyle(child);
-      if (!st || st.display === "none" || st.position === "fixed") continue;
-      fromChildren = Math.max(fromChildren, child.offsetTop + child.offsetHeight);
+    // Bottom margin of the last in-flow child (not included in rects)
+    const lastEl = body.lastElementChild as HTMLElement | null;
+    if (lastEl) {
+      const mb = parseFloat(win?.getComputedStyle(lastEl).marginBottom || "0") || 0;
+      fromBottom += mb;
     }
 
     const scrollH = Math.max(body.scrollHeight || 0, root.scrollHeight || 0);
@@ -1422,37 +1417,16 @@ export class Engine {
     let fromInteract = 0;
     const wrap = body.querySelector(".iframe-wrap") as HTMLElement | null;
     const live = body.querySelector("canvas, .live-frame") as HTMLElement | null;
-    if (wrap) {
-      fromInteract = Math.max(wrap.offsetHeight, wrap.getBoundingClientRect().height, layoutW * 0.55);
-    } else if (live) {
-      fromInteract = Math.max(live.offsetHeight, layoutW * 0.5);
-    }
+    if (wrap) fromInteract = Math.max(wrap.offsetHeight, layoutW * 0.55);
+    else if (live) fromInteract = Math.max(live.offsetHeight, layoutW * 0.5);
 
-    const hasInteract = !!(wrap || live || body.querySelector("canvas"));
-    const hasVideo = !!body.querySelector("video");
-    const hasImg = !!body.querySelector("img");
+    // Never smaller than any signal — content must always fit
+    let sh = Math.max(scrollH, fromBottom, fromMedia, fromInteract, 60);
 
-    // Pick the best signal; reject scrollH if it's clearly empty expansion vs media
-    const candidates = [fromRange, fromChildren, fromMedia, fromInteract].filter((n) => n > 20);
-    let sh = candidates.length ? Math.max(...candidates) : scrollH;
+    // Only a very high safety ceiling (protects against runaway layouts)
+    sh = Math.min(sh, 60000);
 
-    // If scrollH agrees roughly, allow it; if much larger, ignore (empty band)
-    if (scrollH > sh * 1.35 && sh > 40) {
-      /* keep sh */
-    } else if (scrollH > sh) {
-      sh = scrollH;
-    }
-
-    if (hasInteract) sh = Math.max(sh, fromInteract || layoutW * 0.55, 200);
-    else if (hasVideo) sh = Math.max(sh, 140);
-    else if (hasImg) sh = Math.max(sh, 80);
-    else sh = Math.max(sh, 60);
-
-    // Caps: avoid multi-screen empty pages
-    if (!hasInteract) sh = Math.min(sh, layoutW * 1.8 + fromMedia);
-    else sh = Math.min(sh, 4200);
-
-    page.baseH = Math.max(48, Math.ceil(sh + 6));
+    page.baseH = Math.ceil(sh + 8);
     this.ensureTiles(page);
 
     // Restore iframe to fill the tight shell
@@ -1467,12 +1441,12 @@ export class Engine {
     iframe.style.touchAction = "auto";
   }
 
-
   private watchHtml() {
     this.htmlObserver?.disconnect();
     if (this.doc?.kind !== "html") return;
-    // One-shot remeasure after images load — do not keep observing in a way
-    // that re-inflates page height (that caused huge empty regions).
+    // Remeasure when content size changes (images / fonts finishing). Safe from
+    // feedback loops because measureHtml shrinks the iframe to 80px first, so the
+    // shell height never feeds back into the measurement.
     this.htmlObserver = new ResizeObserver(() => {
       if (this.doc?.kind !== "html" || this.mode === "pinch") return;
       window.clearTimeout(this.resizeT);
@@ -1483,14 +1457,7 @@ export class Engine {
           if (!page.iframe?.contentDocument?.body) continue;
           const prev = page.baseH;
           this.measureHtml(page, page.baseW || this.htmlLayoutW || this.availableWidth());
-          // Only accept shrink or modest growth (image finished loading)
-          if (page.baseH > prev + 80) {
-            // Reject large growth — keep previous tight height
-            page.baseH = prev;
-            this.ensureTiles(page);
-          } else if (Math.abs(page.baseH - prev) > 12) {
-            changed = true;
-          }
+          if (Math.abs(page.baseH - prev) > 4) changed = true;
         }
         if (changed) {
           this.layout();
@@ -1499,8 +1466,27 @@ export class Engine {
       }, 200);
     });
     for (const page of this.doc.pages) {
-      const body = page.iframe?.contentDocument?.body;
-      if (body) this.htmlObserver.observe(body);
+      const d = page.iframe?.contentDocument;
+      if (!d?.body) continue;
+      this.htmlObserver.observe(d.body);
+      this.htmlObserver.observe(d.documentElement);
+      for (const img of d.images) {
+        if (!img.complete) {
+          img.addEventListener(
+            "load",
+            () => {
+              window.clearTimeout(this.resizeT);
+              this.resizeT = window.setTimeout(() => {
+                if (!this.alive || !page.shell.isConnected) return;
+                this.measureHtml(page, page.baseW);
+                this.layout();
+                this.mountVisible(false);
+              }, 120);
+            },
+            { once: true },
+          );
+        }
+      }
     }
   }
 
@@ -1907,10 +1893,15 @@ export class Engine {
       if (dataSrc) {
         iframe.src = dataSrc;
         void waitForFrame(iframe, 1500).then(() => {
-          if (!this.alive || !page.shell.isConnected) return;
-          if (this.mode === "pinch") return;
-          this.measureHtml(page, page.baseW || this.availableWidth());
-          this.layout();
+          if (!this.alive || !page.shell.isConnected || this.mode === "pinch") return;
+          const run = () => {
+            if (!this.alive || !page.shell.isConnected) return;
+            this.measureHtml(page, page.baseW || this.availableWidth());
+            this.layout();
+          };
+          run();
+          // Second pass: fonts / images may still be settling
+          window.setTimeout(run, 600);
         });
       }
     }
