@@ -144,7 +144,8 @@ const MOBILE_FIX = `<meta name="viewport" content="width=device-width, initial-s
 <style id="teachpdf-view-fix">
 html,body{margin:0;height:auto!important;min-height:100%;overflow:visible!important;touch-action:auto!important;}
 /* Images/video fluid — but NOT canvas (interactive sims need crisp pixel sizing) */
-img,video,svg{max-width:100%;height:auto;}
+img,video,svg{max-width:100%!important;width:100%!important;height:auto!important;display:block!important;margin:0 auto!important;}
+figure,picture{width:100%!important;max-width:100%!important;margin:0!important;}
 canvas{max-width:none;image-rendering:auto;}
 video{
   background:#000;
@@ -156,7 +157,7 @@ video{
 .page,.pdf-page,.pdfPage,.slide,section.page,[data-page]{
   display:block!important;visibility:visible!important;opacity:1!important;
   position:relative!important;inset:auto!important;transform:none!important;
-  overflow:visible!important;height:auto!important;
+  overflow:visible!important;height:auto!important;min-height:160px;
 }
 .iframe-wrap,.live-frame,iframe{
   touch-action:auto!important;
@@ -200,6 +201,7 @@ video{
   }
   .page{
     padding:10px!important;
+    min-height:auto!important;
   }
 }
 </style>
@@ -505,7 +507,6 @@ export class Engine {
   private pdf: PdfDocProxy | null = null;
   private pdfBlob: Blob | null = null;
   private htmlSource = "";
-  private htmlLayoutW = 0;
   private docName = "";
   private docGen = 0;
   private pageByEl = new Map<Element, Page>();
@@ -1338,98 +1339,131 @@ export class Engine {
     const win = doc.defaultView;
     page.baseW = layoutW;
 
+    // --- Force media to full page width (fixes left thumbnail + empty white) ---
+    body.style.setProperty("margin", "0", "important");
+    body.style.setProperty("padding", "0", "important");
+    body.style.setProperty("width", "100%", "important");
+    root.style.setProperty("width", "100%", "important");
+
+    for (const el of body.querySelectorAll<HTMLElement>(
+      ".page,.pdf-page,.slide,section.page,[data-page],main,article,figure,picture,header,section,div",
+    )) {
+      el.style.setProperty("min-height", "0", "important");
+      el.style.setProperty("max-width", "100%", "important");
+      // Do not force every div to 100% width (breaks layouts); only clear float constraints
+      if (el.tagName === "FIGURE" || el.tagName === "PICTURE" || el.classList.contains("page")) {
+        el.style.setProperty("width", "100%", "important");
+        el.style.setProperty("margin", "0", "important");
+        el.style.setProperty("padding", "0", "important");
+      }
+    }
+
+    for (const img of body.querySelectorAll("img")) {
+      if (!(img instanceof HTMLImageElement)) continue;
+      img.style.setProperty("max-width", "100%", "important");
+      img.style.setProperty("width", "100%", "important");
+      img.style.setProperty("height", "auto", "important");
+      img.style.setProperty("display", "block", "important");
+      img.style.setProperty("margin", "0 auto", "important");
+      img.style.setProperty("object-fit", "contain", "important");
+    }
     for (const vid of body.querySelectorAll("video")) {
       if (!(vid instanceof HTMLVideoElement)) continue;
       vid.controls = true;
       vid.setAttribute("playsinline", "");
       vid.setAttribute("webkit-playsinline", "");
-      vid.style.maxWidth = "100%";
-      vid.style.width = "100%";
-      vid.style.height = "auto";
+      vid.style.setProperty("max-width", "100%", "important");
+      vid.style.setProperty("width", "100%", "important");
+      vid.style.setProperty("height", "auto", "important");
+      vid.style.setProperty("display", "block", "important");
       vid.style.pointerEvents = "auto";
     }
-    for (const img of body.querySelectorAll("img")) {
-      if (!(img instanceof HTMLImageElement)) continue;
-      img.style.maxWidth = "100%";
-      img.style.height = "auto";
-      img.style.display = "block";
+
+    // Interactive wraps stay usable
+    for (const wrap of body.querySelectorAll<HTMLElement>(".iframe-wrap")) {
+      wrap.style.setProperty("width", "100%", "important");
+      wrap.style.setProperty("max-width", "100%", "important");
+      wrap.style.setProperty("margin", "0 auto", "important");
     }
 
-    // Remove viewport-filling min-heights from the lesson
-    const stripMin = (el: HTMLElement) => {
-      el.style.setProperty("min-height", "0", "important");
-    };
-    stripMin(root);
-    stripMin(body);
-    body.style.setProperty("margin", "0", "important");
-    body.style.setProperty("height", "auto", "important");
-    root.style.setProperty("height", "auto", "important");
-    for (const el of body.querySelectorAll<HTMLElement>(
-      ".page,.pdf-page,.slide,section.page,[data-page],main,article",
-    )) {
-      stripMin(el);
-      el.style.setProperty("height", "auto", "important");
-    }
-
-    // Give the iframe a real WIDTH so images/% widths compute, but a
-    // modest HEIGHT so 100%-tall children cannot invent empty space.
+    // Size iframe to target width for layout, short height to avoid empty %-height
     const prevCss = iframe.style.cssText;
-    iframe.style.cssText = `position:absolute;left:0;top:0;width:${layoutW}px;height:80px;min-height:0;border:0;visibility:visible;`;
+    iframe.style.cssText = `position:absolute;left:0;top:0;width:${layoutW}px;height:120px;min-height:0;border:0;`;
     void root.offsetHeight;
 
-    // Height from natural image/video aspect (works even if not fully laid out)
+    // Height from full-width media aspect ratios
     let fromMedia = 0;
     for (const img of body.querySelectorAll("img")) {
       if (!(img instanceof HTMLImageElement)) continue;
-      if (img.naturalWidth > 0 && img.naturalHeight > 0) {
+      if (img.naturalWidth > 1 && img.naturalHeight > 1) {
         fromMedia += (layoutW * img.naturalHeight) / img.naturalWidth;
-      } else if (img.offsetHeight > 0) {
+      } else if (img.offsetHeight > 8) {
         fromMedia += img.offsetHeight;
       }
     }
     for (const vid of body.querySelectorAll("video")) {
       if (!(vid instanceof HTMLVideoElement)) continue;
-      if (vid.videoWidth > 0 && vid.videoHeight > 0) {
+      if (vid.videoWidth > 1 && vid.videoHeight > 1) {
         fromMedia = Math.max(fromMedia, (layoutW * vid.videoHeight) / vid.videoWidth);
       }
     }
 
-    // Real content bottom: lowest visible element edge + scroll offset
-    let fromBottom = 0;
-    const scrollY = win?.scrollY ?? 0;
-    for (const el of body.querySelectorAll<HTMLElement>("*")) {
-      const st = win?.getComputedStyle(el);
-      if (!st || st.display === "none" || st.visibility === "hidden" || st.position === "fixed") continue;
-      const r = el.getBoundingClientRect();
-      if (r.height < 1 && r.width < 1) continue;
-      fromBottom = Math.max(fromBottom, r.bottom + scrollY);
+    let fromRange = 0;
+    try {
+      const range = doc.createRange();
+      range.selectNodeContents(body);
+      fromRange = range.getBoundingClientRect().height;
+    } catch {
+      /* ignore */
     }
-    // Bottom margin of the last in-flow child (not included in rects)
-    const lastEl = body.lastElementChild as HTMLElement | null;
-    if (lastEl) {
-      const mb = parseFloat(win?.getComputedStyle(lastEl).marginBottom || "0") || 0;
-      fromBottom += mb;
+
+    let fromChildren = 0;
+    for (const child of Array.from(body.children)) {
+      if (!(child instanceof HTMLElement)) continue;
+      const st = win?.getComputedStyle(child);
+      if (!st || st.display === "none" || st.position === "fixed") continue;
+      fromChildren = Math.max(fromChildren, child.offsetTop + child.offsetHeight);
+    }
+
+    let fromInteract = 0;
+    const wrap = body.querySelector(".iframe-wrap") as HTMLElement | null;
+    const canvas = body.querySelector("canvas");
+    if (wrap) {
+      fromInteract = Math.max(
+        wrap.offsetHeight,
+        wrap.getBoundingClientRect().height,
+        Math.round(layoutW * 0.56),
+      );
+    } else if (canvas) {
+      fromInteract = Math.max(canvas.getBoundingClientRect().height, Math.round(layoutW * 0.5));
+    }
+
+    const hasInteract = !!(wrap || canvas || body.querySelector(".live-frame"));
+    const hasVideo = !!body.querySelector("video");
+    const hasImg = !!body.querySelector("img");
+
+    // Prefer media aspect when page is image/GIF-led (pages 1–2 style)
+    let sh: number;
+    if (hasImg && fromMedia > 40 && !hasInteract) {
+      sh = fromMedia;
+    } else {
+      sh = Math.max(fromRange, fromChildren, fromMedia, fromInteract);
     }
 
     const scrollH = Math.max(body.scrollHeight || 0, root.scrollHeight || 0);
+    if (scrollH > sh && scrollH < sh * 1.3) sh = scrollH;
 
-    // Interactive block
-    let fromInteract = 0;
-    const wrap = body.querySelector(".iframe-wrap") as HTMLElement | null;
-    const live = body.querySelector("canvas, .live-frame") as HTMLElement | null;
-    if (wrap) fromInteract = Math.max(wrap.offsetHeight, layoutW * 0.55);
-    else if (live) fromInteract = Math.max(live.offsetHeight, layoutW * 0.5);
+    if (hasInteract) sh = Math.max(sh, fromInteract || Math.round(layoutW * 0.56), 200);
+    else if (hasVideo) sh = Math.max(sh, 140);
+    else if (hasImg) sh = Math.max(sh, Math.round(layoutW * 0.25));
+    else sh = Math.max(sh, 60);
 
-    // Never smaller than any signal — content must always fit
-    let sh = Math.max(scrollH, fromBottom, fromMedia, fromInteract, 60);
+    if (!hasInteract) sh = Math.min(sh, layoutW * 2.2);
+    else sh = Math.min(sh, 4200);
 
-    // Only a very high safety ceiling (protects against runaway layouts)
-    sh = Math.min(sh, 60000);
-
-    page.baseH = Math.ceil(sh + 8);
+    page.baseH = Math.max(48, Math.ceil(sh + 4));
     this.ensureTiles(page);
 
-    // Restore iframe to fill the tight shell
     iframe.style.cssText = prevCss || "";
     iframe.style.position = "absolute";
     iframe.style.left = "0";
@@ -1441,12 +1475,12 @@ export class Engine {
     iframe.style.touchAction = "auto";
   }
 
+
   private watchHtml() {
     this.htmlObserver?.disconnect();
     if (this.doc?.kind !== "html") return;
-    // Remeasure when content size changes (images / fonts finishing). Safe from
-    // feedback loops because measureHtml shrinks the iframe to 80px first, so the
-    // shell height never feeds back into the measurement.
+    // One-shot remeasure after images load — do not keep observing in a way
+    // that re-inflates page height (that caused huge empty regions).
     this.htmlObserver = new ResizeObserver(() => {
       if (this.doc?.kind !== "html" || this.mode === "pinch") return;
       window.clearTimeout(this.resizeT);
@@ -1457,7 +1491,14 @@ export class Engine {
           if (!page.iframe?.contentDocument?.body) continue;
           const prev = page.baseH;
           this.measureHtml(page, page.baseW || this.htmlLayoutW || this.availableWidth());
-          if (Math.abs(page.baseH - prev) > 4) changed = true;
+          // Only accept shrink or modest growth (image finished loading)
+          if (page.baseH > prev + 80) {
+            // Reject large growth — keep previous tight height
+            page.baseH = prev;
+            this.ensureTiles(page);
+          } else if (Math.abs(page.baseH - prev) > 12) {
+            changed = true;
+          }
         }
         if (changed) {
           this.layout();
@@ -1466,27 +1507,8 @@ export class Engine {
       }, 200);
     });
     for (const page of this.doc.pages) {
-      const d = page.iframe?.contentDocument;
-      if (!d?.body) continue;
-      this.htmlObserver.observe(d.body);
-      this.htmlObserver.observe(d.documentElement);
-      for (const img of d.images) {
-        if (!img.complete) {
-          img.addEventListener(
-            "load",
-            () => {
-              window.clearTimeout(this.resizeT);
-              this.resizeT = window.setTimeout(() => {
-                if (!this.alive || !page.shell.isConnected) return;
-                this.measureHtml(page, page.baseW);
-                this.layout();
-                this.mountVisible(false);
-              }, 120);
-            },
-            { once: true },
-          );
-        }
-      }
+      const body = page.iframe?.contentDocument?.body;
+      if (body) this.htmlObserver.observe(body);
     }
   }
 
@@ -1893,15 +1915,10 @@ export class Engine {
       if (dataSrc) {
         iframe.src = dataSrc;
         void waitForFrame(iframe, 1500).then(() => {
-          if (!this.alive || !page.shell.isConnected || this.mode === "pinch") return;
-          const run = () => {
-            if (!this.alive || !page.shell.isConnected) return;
-            this.measureHtml(page, page.baseW || this.availableWidth());
-            this.layout();
-          };
-          run();
-          // Second pass: fonts / images may still be settling
-          window.setTimeout(run, 600);
+          if (!this.alive || !page.shell.isConnected) return;
+          if (this.mode === "pinch") return;
+          this.measureHtml(page, page.baseW || this.availableWidth());
+          this.layout();
         });
       }
     }
