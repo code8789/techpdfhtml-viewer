@@ -524,6 +524,13 @@ export class Engine {
   /** Desktop: click-hold converts draw/laser into pan */
   private holdPanTimer = 0;
   private holdPanAt: { x: number; y: number } | null = null;
+  /** Hand tool on HTML: wait to see if user clicks (video) or drags (pan) */
+  private htmlHandPending: {
+    x: number;
+    y: number;
+    pointerId: number;
+    page: Page;
+  } | null = null;
   private pinchDist = 1;
   private pinchStartZoom = 1;
   private lastMid = { x: 0, y: 0 };
@@ -555,6 +562,7 @@ export class Engine {
   } | null = null;
   private laser: HTMLDivElement;
   private videoFocus = false;
+  private contentOverlay: HTMLDivElement | null = null;
   private paintRaf = 0;
   private scrollRaf = 0;
   private statusN = 0;
@@ -571,6 +579,7 @@ export class Engine {
     this.laser = document.createElement("div");
     this.laser.className = "laser-dot";
     document.body.appendChild(this.laser);
+    this.ensureGapStyle();
     const scroll = els.scroll;
     scroll.addEventListener("pointerdown", this.onPointerDown, { capture: true });
     scroll.addEventListener("pointermove", this.onPointerMove, { capture: true });
@@ -581,6 +590,7 @@ export class Engine {
     scroll.addEventListener("scroll", this.onScroll, { passive: true });
     scroll.addEventListener("contextmenu", this.onContext);
     scroll.addEventListener("pointerleave", this.onPointerLeave);
+    scroll.addEventListener("pointermove", this.onScrollEdgeHover, { passive: true });
     scroll.addEventListener("gesturestart", this.blockGesture);
     scroll.addEventListener("gesturechange", this.blockGesture);
     window.addEventListener("keydown", this.onKey);
@@ -610,6 +620,7 @@ export class Engine {
     scroll.removeEventListener("scroll", this.onScroll);
     scroll.removeEventListener("contextmenu", this.onContext);
     scroll.removeEventListener("pointerleave", this.onPointerLeave);
+    scroll.removeEventListener("pointermove", this.onScrollEdgeHover);
     scroll.removeEventListener("gesturestart", this.blockGesture);
     scroll.removeEventListener("gesturechange", this.blockGesture);
     window.removeEventListener("keydown", this.onKey);
@@ -849,6 +860,7 @@ export class Engine {
     this.watchHtml();
     this.layout();
     this.mountVisible(true);
+    for (const page of pages) this.ensureContentFsButton(page);
     this.patch({ progress: null });
     this.say(
       pages.length > 1
@@ -951,11 +963,14 @@ export class Engine {
   }
 
   zoomIn() {
-    this.zoomAround(this.userZoom * 1.2);
+    // 10% steps, snapped (e.g. 100 → 110 → 120)
+    const next = Math.round((this.userZoom + 0.1) * 10) / 10;
+    this.zoomAround(next);
   }
 
   zoomOut() {
-    this.zoomAround(this.userZoom / 1.2);
+    const next = Math.round((this.userZoom - 0.1) * 10) / 10;
+    this.zoomAround(next);
   }
 
   fit() {
@@ -1021,6 +1036,7 @@ export class Engine {
     page.media.push(media);
     this.syncMedia(page);
     this.selectMedia(media.id);
+    this.ensureContentFsButton(page);
     this.say(
       kind === "video"
         ? "Video added — drag / rotate / resize"
@@ -1425,10 +1441,10 @@ export class Engine {
     if (sw > layoutW + 48) page.baseW = Math.min(sw, 2400);
     else page.baseW = layoutW;
 
-    // Ensure interactive pages are tall enough that the sim is not clipped
-    const hasInteract = !!body.querySelector(".iframe-wrap, .live-frame, video");
-    const minH = hasInteract ? Math.max(480, interactH + 80) : 400;
-    page.baseH = Math.min(80000, Math.max(minH, Math.ceil(sh + 32)));
+    // Use real content height — do not pad hundreds of empty pixels between pages
+    const hasInteract = !!body.querySelector(".iframe-wrap, .live-frame, video, canvas");
+    const minH = hasInteract ? 320 : 200;
+    page.baseH = Math.min(80000, Math.max(minH, Math.ceil(sh + 16)));
     this.ensureTiles(page);
 
     // Size the iframe itself to fill the page so touches hit the content
@@ -1492,6 +1508,9 @@ export class Engine {
     mediaLayer.className = "media-layer";
     const tilesHost = document.createElement("div");
     tilesHost.className = "tiles-host";
+    // Ink must not block video controls / HTML hits underneath
+    tilesHost.style.pointerEvents = "none";
+    mediaLayer.style.pointerEvents = "auto";
     inner.append(fill, mediaLayer, tilesHost);
     shell.appendChild(inner);
     this.els.stage.appendChild(shell);
@@ -1541,6 +1560,7 @@ export class Engine {
 
   private clearDoc() {
     this.thumbToken++;
+    this.closeContentFullscreen();
     this.htmlObserver?.disconnect();
     this.htmlObserver = null;
     this.clearVideoFocus();
@@ -1606,11 +1626,13 @@ export class Engine {
         page.tilesHost.style.transform = "";
         page.tilesHost.style.width = "";
         page.tilesHost.style.height = "";
+        page.tilesHost.style.pointerEvents = "none";
       }
       if (page.mediaLayer) {
         page.mediaLayer.style.transform = "";
         page.mediaLayer.style.width = "";
         page.mediaLayer.style.height = "";
+        page.mediaLayer.style.pointerEvents = "auto";
       }
     }
     if (Math.abs(this.visualRatio - 1) < 0.001) {
@@ -1622,9 +1644,121 @@ export class Engine {
   }
 
   private applyChromeSpace() {
-    const pad = 12 / this.visualRatio;
-    this.els.stage.style.padding = `${pad}px`;
-    this.els.stage.style.gap = `${pad}px`;
+    const stage = this.els.stage;
+    stage.style.setProperty("display", "block", "important");
+    stage.style.setProperty("padding", "2px", "important");
+    stage.style.setProperty("gap", "0px", "important");
+    stage.style.setProperty("row-gap", "0px", "important");
+    stage.style.setProperty("column-gap", "0px", "important");
+    const pages = this.doc?.pages ?? [];
+    pages.forEach((page, i) => {
+      page.shell.style.setProperty("display", "block", "important");
+      page.shell.style.setProperty("padding", "0", "important");
+      // One-line gap under every page except the last
+      const mb = i < pages.length - 1 ? "4px" : "0";
+      page.shell.style.setProperty("margin", `0 auto ${mb} auto`, "important");
+    });
+  }
+
+  private ensureGapStyle() {
+    for (const id of ["teachpdf-gap-fix", "teachpdf-gap-fix-v2", "teachpdf-gap-fix-v3"]) {
+      document.getElementById(id)?.remove();
+    }
+    const s = document.createElement("style");
+    s.id = "teachpdf-gap-fix-v3";
+    s.textContent = `
+      .teach-stage {
+        display: block !important;
+        gap: 0 !important;
+        row-gap: 0 !important;
+        column-gap: 0 !important;
+        padding: 2px !important;
+      }
+      .page-shell {
+        display: block !important;
+        margin-left: auto !important;
+        margin-right: auto !important;
+        margin-top: 0 !important;
+        padding: 0 !important;
+      }
+      .page-inner { margin: 0 !important; padding: 0 !important; }
+      .tiles-host { pointer-events: none !important; }
+      .media-item video, .html-frame video {
+        pointer-events: auto !important;
+        touch-action: manipulation !important;
+      }
+      /* Scrollbar hidden until pointer is on the right edge */
+      .teach-scroll {
+        scrollbar-width: thin;
+        scrollbar-color: transparent transparent;
+      }
+      .teach-scroll:hover,
+      .teach-scroll.is-scroll-hover {
+        scrollbar-color: rgba(100,116,139,0.7) transparent;
+      }
+      .teach-scroll::-webkit-scrollbar { width: 10px; background: transparent; }
+      .teach-scroll::-webkit-scrollbar-thumb {
+        background: transparent;
+        border-radius: 8px;
+      }
+      .teach-scroll:hover::-webkit-scrollbar-thumb,
+      .teach-scroll.is-scroll-hover::-webkit-scrollbar-thumb {
+        background: rgba(100,116,139,0.65);
+      }
+      /* Fullscreen content button on each page */
+      .teach-content-fs {
+        position: absolute;
+        right: 10px;
+        bottom: 10px;
+        z-index: 50;
+        width: 40px;
+        height: 40px;
+        border: none;
+        border-radius: 10px;
+        background: rgba(15,23,42,0.82);
+        color: #e2e8f0;
+        font-size: 18px;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        pointer-events: auto;
+        box-shadow: 0 2px 10px rgba(0,0,0,0.35);
+      }
+      .teach-content-fs:hover { background: rgba(15,23,42,0.95); }
+      .teach-content-overlay {
+        position: fixed;
+        inset: 0;
+        z-index: 99999;
+        background: #000;
+        display: flex;
+        flex-direction: column;
+      }
+      .teach-content-overlay iframe,
+      .teach-content-overlay video {
+        flex: 1;
+        width: 100%;
+        height: 100%;
+        border: 0;
+        background: #000;
+      }
+      .teach-content-overlay-bar {
+        position: absolute;
+        top: 12px;
+        right: 12px;
+        z-index: 2;
+      }
+      .teach-content-overlay-bar button {
+        border: none;
+        border-radius: 10px;
+        padding: 10px 16px;
+        background: rgba(15,23,42,0.88);
+        color: #fff;
+        font: 14px system-ui,sans-serif;
+        cursor: pointer;
+      }
+    `;
+    document.head.appendChild(s);
   }
 
   private applyTransform() {
@@ -1662,7 +1796,7 @@ export class Engine {
 
   private zoomAt(next: number, clientX: number, clientY: number) {
     if (!this.doc) return;
-    next = clamp(next, MIN_Z, MAX_Z);
+    next = clamp(Math.round(next * 10) / 10, MIN_Z, MAX_Z);
     const old = Math.max(0.05, this.committedZoom);
     if (Math.abs(next - old) < 0.001) {
       this.hooks.onZoom(this.userZoom);
@@ -1777,6 +1911,7 @@ export class Engine {
       void this.renderPdf(page);
     }
     this.syncTiles(page, force);
+    this.ensureContentFsButton(page);
   }
 
   private unmountPage(page: Page) {
@@ -2049,7 +2184,14 @@ export class Engine {
       video.controls = true;
       video.playsInline = true;
       video.setAttribute("playsinline", "");
+      video.setAttribute("webkit-playsinline", "");
+      video.setAttribute("controls", "true");
       video.preload = "metadata";
+      video.style.width = "100%";
+      video.style.height = "100%";
+      video.style.objectFit = "contain";
+      video.style.pointerEvents = "auto";
+      video.style.touchAction = "manipulation";
       el.appendChild(video);
     } else {
       const img = document.createElement("img");
@@ -2199,6 +2341,48 @@ export class Engine {
       capture();
       return;
     }
+    // Selected media handles (resize/rotate) always drag
+    if (hit && hit.mode && hit.isHandle && this.selectedMediaId === hit.media.id) {
+      this.beginMedia(hit, event, hit.mode);
+      event.preventDefault();
+      capture();
+      return;
+    }
+
+    // Hand + video media: unlock native controls (don't start drag)
+    if (hit && prefs.tool === "hand" && hit.media.kind === "video") {
+      const video = hit.el.querySelector("video");
+      if (video instanceof HTMLVideoElement) {
+        video.controls = true;
+        video.setAttribute("playsinline", "");
+        video.setAttribute("webkit-playsinline", "");
+        video.style.pointerEvents = "auto";
+        video.style.touchAction = "manipulation";
+        this.videoFocus = true;
+        this.patch({ video: true });
+        try {
+          video.focus({ preventScroll: true });
+        } catch {
+          try {
+            video.focus();
+          } catch {
+            /* ignore */
+          }
+        }
+        // Toggle play on this user gesture (required on mobile)
+        if (video.paused) {
+          void video.play().catch(() => {
+            /* user can use controls */
+          });
+        } else {
+          video.pause();
+        }
+        this.say("Video ready – use the controls");
+        // Do not capture — let controls receive later taps
+        return;
+      }
+    }
+
     if (hit && hit.mode === "move" && (prefs.tool === "hand" || this.selectedMediaId === hit.media.id)) {
       this.selectMedia(hit.media.id);
       this.beginMedia(hit, event, "move");
@@ -2215,14 +2399,33 @@ export class Engine {
     }
 
     if (prefs.tool === "hand") {
-      // Prefer letting video controls and interactive HTML receive the touch.
-      // Only start a pan when the touch is clearly on empty page chrome.
+      // Always try video / tap-to-interact first (no capture)
       const interacted = this.tryInteractHtml(event.clientX, event.clientY);
-      if (interacted) {
-        // Do not preventDefault / setPointerCapture – the browser must
-        // deliver this gesture to the <video> or nested interactive page.
-        return;
+      if (interacted) return;
+
+      const page = this.pageAt(event.clientX, event.clientY);
+      // Over an HTML iframe: do NOT capture yet — a click must reach the video.
+      // If the pointer moves, we start pan in pointermove.
+      if (page?.iframe) {
+        const ir = page.iframe.getBoundingClientRect();
+        if (
+          event.clientX >= ir.left &&
+          event.clientX <= ir.right &&
+          event.clientY >= ir.top &&
+          event.clientY <= ir.bottom
+        ) {
+          this.htmlHandPending = {
+            x: event.clientX,
+            y: event.clientY,
+            pointerId: event.pointerId,
+            page,
+          };
+          // Do not preventDefault / setPointerCapture — allow the iframe click
+          return;
+        }
       }
+
+      this.htmlHandPending = null;
       this.beginPan(event);
       event.preventDefault();
       capture();
@@ -2313,6 +2516,31 @@ export class Engine {
       tracked.x = event.clientX;
       tracked.y = event.clientY;
     }
+    // Hand on HTML: convert to pan once the user actually drags
+    if (this.htmlHandPending && this.htmlHandPending.pointerId === event.pointerId) {
+      const dx = event.clientX - this.htmlHandPending.x;
+      const dy = event.clientY - this.htmlHandPending.y;
+      if (Math.hypot(dx, dy) > 8) {
+        const startX = this.htmlHandPending.x;
+        const startY = this.htmlHandPending.y;
+        this.htmlHandPending = null;
+        this.mode = "pan";
+        this.panX = startX;
+        this.panY = startY;
+        this.panT = performance.now();
+        this.panMoved = 0;
+        this.panVx = 0;
+        this.panVy = 0;
+        try {
+          this.els.scroll.setPointerCapture(event.pointerId);
+        } catch {
+          /* ignore */
+        }
+        event.preventDefault();
+        this.movePan(event);
+        return;
+      }
+    }
     if (this.mode === "pinch" && this.pointers.size >= 2) {
       event.preventDefault();
       this.movePinch();
@@ -2371,6 +2599,7 @@ export class Engine {
     }
     if (this.pointers.size > 0) return;
     this.blockUntilUp = false;
+    this.htmlHandPending = null;
     this.clearHoldPan();
     if (this.mode === "pan") this.finishPan(event);
     else if (this.mode === "draw") this.finishDraw();
@@ -2437,6 +2666,15 @@ export class Engine {
     if (event.pointerType === "mouse" && this.hooks.getPrefs().tool === "laser") {
       this.hideLaser();
     }
+    this.els.scroll.classList.remove("is-scroll-hover");
+  };
+
+  /** Show scrollbar only when the pointer is near the right edge. */
+  private onScrollEdgeHover = (event: PointerEvent) => {
+    if (event.pointerType !== "mouse") return;
+    const r = this.els.scroll.getBoundingClientRect();
+    const nearRight = event.clientX >= r.right - 18;
+    this.els.scroll.classList.toggle("is-scroll-hover", nearRight);
   };
 
   private blockGesture = (event: Event) => {
@@ -2837,6 +3075,216 @@ export class Engine {
     this.laser.style.display = "none";
   }
 
+  /** Attach bottom-right fullscreen button on HTML / video pages. */
+  private ensureContentFsButton(page: Page) {
+    if (page.shell.querySelector(".teach-content-fs")) return;
+    const hasHtml = !!page.iframe;
+    const hasVideoMedia = page.media.some((m) => m.kind === "video");
+    if (!hasHtml && !hasVideoMedia) return;
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "teach-content-fs";
+    btn.title = "Open content fullscreen";
+    btn.setAttribute("aria-label", "Open content fullscreen");
+    btn.textContent = "⛶";
+    btn.addEventListener("pointerdown", (e) => {
+      e.stopPropagation();
+      e.preventDefault();
+    });
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      e.preventDefault();
+      this.openContentFullscreen(page);
+    });
+    page.shell.style.position = "relative";
+    page.shell.appendChild(btn);
+  }
+
+  /** Fullscreen overlay: only the interactive HTML or video, nothing else. */
+  openContentFullscreen(page?: Page) {
+    const p = page || this.currentPage();
+    if (!p) {
+      this.say("Open a page first");
+      return;
+    }
+    this.closeContentFullscreen();
+
+    const overlay = document.createElement("div");
+    overlay.className = "teach-content-overlay";
+    const bar = document.createElement("div");
+    bar.className = "teach-content-overlay-bar";
+    const closeBtn = document.createElement("button");
+    closeBtn.type = "button";
+    closeBtn.textContent = "Exit fullscreen";
+    closeBtn.addEventListener("click", () => this.closeContentFullscreen());
+    bar.appendChild(closeBtn);
+    overlay.appendChild(bar);
+
+    // Prefer HTML iframe lesson
+    if (p.iframe) {
+      const src =
+        p.iframe.dataset.src ||
+        p.iframe.getAttribute("src") ||
+        p.iframe.src ||
+        "";
+      const frame = document.createElement("iframe");
+      frame.setAttribute(
+        "sandbox",
+        "allow-scripts allow-same-origin allow-forms allow-popups allow-presentation",
+      );
+      frame.setAttribute("allow", "autoplay; fullscreen; picture-in-picture");
+      frame.src = src;
+      // Auto-unlock interactive content after load
+      frame.addEventListener("load", () => {
+        try {
+          const doc = frame.contentDocument;
+          if (!doc) return;
+          for (const live of doc.querySelectorAll<HTMLIFrameElement>(".live-frame, iframe[data-src]")) {
+            const s = live.getAttribute("data-src") || live.dataset.src || "";
+            if (s && !live.dataset.loaded) {
+              live.src = s;
+              live.dataset.loaded = "1";
+            }
+          }
+          for (const btn of doc.querySelectorAll<HTMLElement>(".tap-to-play")) {
+            btn.classList.add("hidden");
+            try {
+              btn.click();
+            } catch {
+              /* ignore */
+            }
+          }
+          for (const v of doc.querySelectorAll("video")) {
+            v.setAttribute("controls", "true");
+            v.setAttribute("playsinline", "");
+            (v as HTMLVideoElement).controls = true;
+          }
+        } catch {
+          /* ignore */
+        }
+      });
+      overlay.appendChild(frame);
+    } else {
+      const vidMedia = p.media.find((m) => m.kind === "video");
+      if (vidMedia) {
+        const video = document.createElement("video");
+        video.src = vidMedia.src;
+        video.controls = true;
+        video.autoplay = true;
+        video.playsInline = true;
+        video.setAttribute("playsinline", "");
+        overlay.appendChild(video);
+        void video.play().catch(() => {
+          /* controls available */
+        });
+      } else {
+        this.say("No interactive content on this page");
+        return;
+      }
+    }
+
+    document.body.appendChild(overlay);
+    this.contentOverlay = overlay;
+    const onKey = (ev: KeyboardEvent) => {
+      if (ev.key === "Escape") this.closeContentFullscreen();
+    };
+    window.addEventListener("keydown", onKey);
+    (overlay as HTMLDivElement & { _onKey?: (e: KeyboardEvent) => void })._onKey = onKey;
+    this.say("Content fullscreen — press Esc to exit");
+  }
+
+  closeContentFullscreen() {
+    const overlay = this.contentOverlay;
+    if (!overlay) return;
+    const onKey = (overlay as HTMLDivElement & { _onKey?: (e: KeyboardEvent) => void })._onKey;
+    if (onKey) window.removeEventListener("keydown", onKey);
+    overlay.remove();
+    this.contentOverlay = null;
+  }
+
+  /** Hit-test videos by viewport box (works with native control bar on desktop). */
+  private videoAtPoint(doc: Document, x: number, y: number): HTMLVideoElement | null {
+    for (const node of doc.querySelectorAll("video")) {
+      if (!(node instanceof HTMLVideoElement)) continue;
+      const r = node.getBoundingClientRect();
+      // Include a few px under the box for the control bar on some browsers
+      if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom + 6) return node;
+    }
+    return null;
+  }
+
+  private unlockVideo(video: HTMLVideoElement, iframe?: HTMLIFrameElement | null) {
+    video.setAttribute("playsinline", "");
+    video.setAttribute("webkit-playsinline", "");
+    video.setAttribute("controls", "true");
+    video.controls = true;
+    video.style.pointerEvents = "auto";
+    video.style.touchAction = "manipulation";
+    if (iframe) {
+      iframe.style.pointerEvents = "auto";
+      iframe.style.touchAction = "auto";
+      iframe.classList.add("is-live");
+    }
+    this.videoFocus = true;
+    this.patch({ video: true });
+    try {
+      video.focus({ preventScroll: true });
+    } catch {
+      try {
+        video.focus();
+      } catch {
+        /* ignore */
+      }
+    }
+    if (video.paused) {
+      void video.play().catch(() => {
+        /* controls still available */
+      });
+      this.say("Playing – click controls to pause");
+    } else {
+      video.pause();
+      this.say("Paused");
+    }
+  }
+
+  private unlockInteractive(page: Page, iframe: HTMLIFrameElement, tapBtn?: HTMLElement | null) {
+    const doc = iframe.contentDocument;
+    const root = tapBtn?.closest(".iframe-wrap") || doc;
+    if (root) {
+      for (const live of root.querySelectorAll<HTMLIFrameElement>(".live-frame, iframe[data-src]")) {
+        const src = live.getAttribute("data-src") || live.dataset.src || live.getAttribute("src") || "";
+        if (src && (!live.dataset.loaded || live.getAttribute("src") !== src)) {
+          live.src = src;
+          live.dataset.loaded = "1";
+        }
+        try {
+          live.focus();
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+    if (tapBtn) {
+      tapBtn.classList.add("hidden");
+      try {
+        tapBtn.click();
+      } catch {
+        /* ignore */
+      }
+    }
+    // Hide any other overlays on the page
+    doc?.querySelectorAll(".tap-to-play").forEach((b) => b.classList.add("hidden"));
+    iframe.classList.add("is-live");
+    iframe.style.pointerEvents = "auto";
+    iframe.style.touchAction = "auto";
+    this.say("Interactive page unlocked");
+    window.setTimeout(() => {
+      if (!this.alive || !page.shell.isConnected) return;
+      this.measureHtml(page, page.baseW);
+      this.layout();
+    }, 400);
+  }
+
   /** Returns true if the touch should be left for the HTML content (no pan/capture). */
   private tryInteractHtml(x: number, y: number): boolean {
     const page = this.pageAt(x, y);
@@ -2846,6 +3294,14 @@ export class Engine {
 
     const rect = iframe.getBoundingClientRect();
     if (rect.width < 2 || rect.height < 2) return false;
+    if (x < rect.left || x > rect.right || y < rect.top || y > rect.bottom) return false;
+
+    // Prefer geometry hit-test so native video control bar clicks work on desktop
+    const byBox = this.videoAtPoint(doc, x, y);
+    if (byBox) {
+      this.unlockVideo(byBox, iframe);
+      return true;
+    }
 
     const ix = ((x - rect.left) / rect.width) * iframe.clientWidth;
     const iy = ((y - rect.top) / rect.height) * iframe.clientHeight;
@@ -2856,84 +3312,69 @@ export class Engine {
     } catch {
       return false;
     }
-    if (!el) return false;
+    if (!el) {
+      // Over iframe but no element — still don't steal if video focus
+      return this.videoFocus;
+    }
 
-    // While video is focused, only pass through when the finger is still on a video
     if (this.videoFocus) {
-      if (el.closest("video")) return true;
-      // Tapped outside the video → exit video mode so pan works again
+      if (el.closest("video") || this.videoAtPoint(doc, x, y)) return true;
       this.clearVideoFocus();
       return false;
     }
 
-    // 1. Real <video>
+    // 1. Real <video> via DOM walk
     const video = el.closest("video");
     if (video instanceof HTMLVideoElement) {
-      video.setAttribute("playsinline", "");
-      video.setAttribute("webkit-playsinline", "");
-      video.setAttribute("controls", "true");
-      video.controls = true;
-      video.style.pointerEvents = "auto";
-      video.style.touchAction = "manipulation";
-      video.style.maxWidth = "100%";
-      video.style.width = "100%";
-      video.style.height = "auto";
-
-      // Make sure nothing in our page shell sits above the video
-      iframe.style.pointerEvents = "auto";
-      iframe.style.touchAction = "auto";
-      iframe.classList.add("is-live");
-
-      this.videoFocus = true;
-      this.patch({ video: true });
-      this.say("Video ready – use the controls");
-
-      // Focus so mobile browsers treat later taps as media gestures
-      try {
-        video.focus({ preventScroll: true });
-      } catch {
-        try {
-          video.focus();
-        } catch {
-          /* ignore */
-        }
-      }
+      this.unlockVideo(video, iframe);
       return true;
     }
 
-    // 2. "Tap to interact" button (works again after scrolling away and back)
-    const tapBtn = el.closest(".tap-to-play") as HTMLElement | null;
+    // 2. "Tap to interact" — DOM walk OR geometry (button often sits above a canvas)
+    let tapBtn = el.closest(".tap-to-play") as HTMLElement | null;
+    if (!tapBtn) {
+      for (const node of doc.querySelectorAll(".tap-to-play")) {
+        if (!(node instanceof HTMLElement)) continue;
+        if (node.classList.contains("hidden")) continue;
+        const r = node.getBoundingClientRect();
+        if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) {
+          tapBtn = node;
+          break;
+        }
+      }
+    }
+    // Also: click anywhere on .iframe-wrap unlocks if a tap-to-play exists there
+    if (!tapBtn) {
+      const wrap = el.closest(".iframe-wrap") as HTMLElement | null;
+      const candidate = wrap?.querySelector(".tap-to-play:not(.hidden)") as HTMLElement | null;
+      if (candidate) tapBtn = candidate;
+    }
     if (tapBtn) {
-      const wrap = tapBtn.closest(".iframe-wrap");
-      const live = wrap?.querySelector(".live-frame") as HTMLIFrameElement | null;
+      this.unlockInteractive(page, iframe, tapBtn);
+      return true;
+    }
+
+    // 2b. Any unloaded live-frame under the point → load it
+    const wrapHit = el.closest(".iframe-wrap") as HTMLElement | null;
+    if (wrapHit) {
+      const live = wrapHit.querySelector(".live-frame, iframe[data-src]") as HTMLIFrameElement | null;
       if (live) {
-        const src = live.getAttribute("data-src") || live.getAttribute("src") || live.dataset.src || "";
-        if (src && (live.getAttribute("src") !== src || !live.dataset.loaded)) {
+        const src = live.getAttribute("data-src") || live.dataset.src || live.getAttribute("src") || "";
+        if (src && !live.dataset.loaded) {
           live.src = src;
           live.dataset.loaded = "1";
-        }
-        tapBtn.classList.add("hidden");
-        try {
-          live.focus();
-        } catch {
-          /* ignore */
+          wrapHit.querySelector(".tap-to-play")?.classList.add("hidden");
+          iframe.classList.add("is-live");
+          iframe.style.pointerEvents = "auto";
+          this.say("Interactive page unlocked");
+          window.setTimeout(() => {
+            if (!this.alive || !page.shell.isConnected) return;
+            this.measureHtml(page, page.baseW);
+            this.layout();
+          }, 400);
+          return true;
         }
       }
-      try {
-        tapBtn.click();
-      } catch {
-        /* ignore */
-      }
-      iframe.classList.add("is-live");
-      iframe.style.pointerEvents = "auto";
-      iframe.style.touchAction = "auto";
-      this.say("Interactive page unlocked");
-      window.setTimeout(() => {
-        if (!this.alive || !page.shell.isConnected) return;
-        this.measureHtml(page, page.baseW);
-        this.layout();
-      }, 400);
-      return true;
     }
 
     // 3. Buttons / links
