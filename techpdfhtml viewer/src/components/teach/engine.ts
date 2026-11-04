@@ -16,6 +16,8 @@ const HISTORY = 40;
 const DOCK_GAP = 92;
 const MAX_EDGE = 1536;
 const MAX_CANVAS_EDGE = 8192;
+/** Zoom step for the +/- buttons. 5% per click. */
+const ZOOM_STEP = 0.05;
 /** Soft limits — files above these still open, but we use a leaner path. */
 const LARGE_HTML_BYTES = 12 * 1024 * 1024; // 12 MB
 const HUGE_HTML_BYTES = 40 * 1024 * 1024; // 40 MB
@@ -565,6 +567,10 @@ export class Engine {
     scroll.addEventListener("gesturestart", this.blockGesture);
     scroll.addEventListener("gesturechange", this.blockGesture);
     window.addEventListener("keydown", this.onKey);
+    // Center pages horizontally in the stage
+    this.els.stage.style.display = "flex";
+    this.els.stage.style.flexDirection = "column";
+    this.els.stage.style.alignItems = "center";
     this.resizeObserver = new ResizeObserver(() => {
       const w = this.availableWidth();
       if (Math.abs(w - this.lastAvail) < 2) return;
@@ -925,14 +931,23 @@ export class Engine {
     }
   }
 
+  /**
+   * Zoom in one 5% step.
+   */
   zoomIn() {
-    this.zoomAround(this.userZoom * 1.2);
+    this.stepZoom(1);
   }
 
+  /**
+   * Zoom out one 5% step.
+   */
   zoomOut() {
-    this.zoomAround(this.userZoom / 1.2);
+    this.stepZoom(-1);
   }
 
+  /**
+   * Reset to 100% — one page fills the full screen width, centered.
+   */
   fit() {
     this.zoomAround(1);
   }
@@ -1439,6 +1454,7 @@ export class Engine {
     const shell = document.createElement("div");
     shell.className = "page-shell";
     shell.dataset.page = String(index);
+    shell.style.margin = "0 auto";
     const inner = document.createElement("div");
     inner.className = "page-inner";
     const fill = document.createElement("div");
@@ -1524,8 +1540,12 @@ export class Engine {
     this.els.sizer.style.height = "";
   }
 
+  /**
+   * The visible width of the scroll container.
+   * No horizontal gutter at 100% — the page should fill the screen width.
+   */
   private availableWidth() {
-    return Math.max(220, this.els.scroll.clientWidth - 24);
+    return Math.max(220, this.els.scroll.clientWidth);
   }
 
   private displayScale() {
@@ -1543,6 +1563,7 @@ export class Engine {
       const h = page.baseH * S;
       page.shell.style.width = `${w}px`;
       page.shell.style.height = `${h}px`;
+      page.shell.style.margin = "0 auto";
       page.inner.style.width = `${page.baseW}px`;
       page.inner.style.height = `${page.baseH}px`;
       page.inner.style.transform = `scale(${S})`;
@@ -1557,7 +1578,9 @@ export class Engine {
   }
 
   private applyChromeSpace() {
-    const pad = 12 / this.visualRatio;
+    // At or below 100%, do not add padding — the page must fill the screen.
+    const zoomedIn = this.userZoom > 1.001;
+    const pad = zoomedIn ? 12 / this.visualRatio : 0;
     this.els.stage.style.padding = `${pad}px`;
     this.els.stage.style.gap = `${pad}px`;
   }
@@ -1586,6 +1609,24 @@ export class Engine {
     this.mountVisible(true);
     el.scrollLeft = fx * this.els.sizer.scrollWidth - el.clientWidth / 2;
     el.scrollTop = fy * this.els.sizer.scrollHeight - el.clientHeight / 2;
+  }
+
+  /** Snap an arbitrary zoom value onto the 5% grid. */
+  private snapZoom(z: number) {
+    return clamp(Math.round(z / ZOOM_STEP) * ZOOM_STEP, MIN_Z, MAX_Z);
+  }
+
+  /** Step the committed zoom by one 5% increment. */
+  private stepZoom(dir: 1 | -1) {
+    if (!this.doc) return;
+    // If we are mid pinch/wheel, commit first so the step is measured from
+    // the true committed zoom.
+    if (Math.abs(this.visualRatio - 1) > 0.001) this.commitZoom();
+    const snapped = this.snapZoom(this.userZoom);
+    // If the current value is not on the grid, first move onto it, then step.
+    const base = Math.abs(snapped - this.userZoom) > 0.0005 ? snapped : this.userZoom;
+    const next = this.snapZoom(base + dir * ZOOM_STEP);
+    this.zoomAround(next);
   }
 
   private zoomAround(next: number) {
@@ -1632,8 +1673,11 @@ export class Engine {
     const oy = rect.height / 2;
     const layoutX = (scroll.scrollLeft + ox) / R;
     const layoutY = (scroll.scrollTop + oy) / R;
-    const applied = this.userZoom / this.committedZoom;
-    this.committedZoom = this.userZoom;
+    // Snap to the 5% grid on commit so the % display stays clean.
+    const snapped = this.snapZoom(this.userZoom);
+    const applied = snapped / this.committedZoom;
+    this.userZoom = snapped;
+    this.committedZoom = snapped;
     this.visualRatio = 1;
     this.layout();
     scroll.scrollLeft = layoutX * applied - ox;
